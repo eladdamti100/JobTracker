@@ -9,8 +9,9 @@ education:
   gpa: 88
 
 seeking:
-  - Student position
-  - Intern position
+  types:
+    - Student position
+    - Intern position
   roles:
     - Backend
     - Full-Stack

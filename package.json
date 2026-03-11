@@ -1,0 +1,16 @@
+{
+  "name": "jobtracker-whatsapp",
+  "version": "1.0.0",
+  "description": "WhatsApp group job listener for JobTracker",
+  "main": "scanners/whatsapp_group.js",
+  "scripts": {
+    "start": "node scanners/whatsapp_group.js",
+    "bridge": "python scanners/whatsapp_bridge.py"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.26.1",
+    "qrcode-terminal": "^0.12.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.5"
+  }
+}

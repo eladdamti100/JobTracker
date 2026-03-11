@@ -21,10 +21,13 @@ class Job(Base):
     # Claude scoring
     score = Column(Float)
     reason = Column(Text)
+    level = Column(String)            # student / junior / senior
     role_type = Column(String)
     tech_stack_match = Column(JSON)
     is_student_position = Column(Integer)  # SQLite boolean
     apply_strategy = Column(String)
+    role_summary = Column(Text)       # Hebrew summary from Claude
+    requirements_summary = Column(Text)  # Hebrew requirements from Claude
 
     # Lifecycle
     status = Column(String, default="new", index=True)
