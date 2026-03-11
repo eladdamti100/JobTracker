@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from pathlib import Path
 
@@ -15,7 +15,26 @@ def get_engine():
 def init_db():
     engine = get_engine()
     Base.metadata.create_all(engine)
+    _migrate_db(engine)
     return engine
+
+
+def _migrate_db(engine):
+    """Add new columns to existing tables without dropping data."""
+    new_columns = [
+        ("source", "VARCHAR"),
+        ("notes", "TEXT"),
+        ("referral_type", "VARCHAR"),
+        ("referral_url", "VARCHAR"),
+        ("status_updated_at", "DATETIME"),
+    ]
+    with engine.connect() as conn:
+        for col_name, col_type in new_columns:
+            try:
+                conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {col_name} {col_type}"))
+                conn.commit()
+            except Exception:
+                pass  # Column already exists
 
 
 def get_session():

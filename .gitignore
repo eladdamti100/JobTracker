@@ -30,6 +30,10 @@ logs/*.log
 node_modules/
 whatsapp_session/
 
+# Dashboard
+dashboard/.next/
+dashboard/.env.local
+
 # OS
 .DS_Store
 Thumbs.db

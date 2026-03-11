@@ -202,6 +202,16 @@ def webhook():
 
 
 @cli.command()
+@click.option("--port", default=5001, help="Port to run the API server on")
+def api(port):
+    """Start the REST API server for the dashboard."""
+    from api import app as api_app
+    click.echo(f"Starting REST API on http://0.0.0.0:{port}")
+    click.echo("Dashboard: set NEXT_PUBLIC_API_URL=http://localhost:{port} in dashboard/.env.local")
+    api_app.run(host="0.0.0.0", port=port, debug=False)
+
+
+@cli.command()
 def schedule():
     """Start the scheduler — scans every 12 hours + runs webhook."""
     import os

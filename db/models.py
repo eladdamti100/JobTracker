@@ -35,10 +35,17 @@ class Job(Base):
     cover_letter_used = Column(Text)
     error_message = Column(Text)
 
+    # Dashboard / application tracking
+    source = Column(String)               # HireMeTech / LinkedIn / WhatsApp
+    notes = Column(Text)
+    referral_type = Column(String)        # "referral" or "regular"
+    referral_url = Column(String)
+
     # Timestamps
     found_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     notified_at = Column(DateTime)
     applied_at = Column(DateTime)
+    status_updated_at = Column(DateTime)
 
     def __repr__(self):
         return f"<Job {self.job_id}: {self.company} - {self.title} [{self.status}]>"
