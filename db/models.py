@@ -122,3 +122,24 @@ class ATSFieldMemory(Base):
 
     def __repr__(self):
         return f"<ATSFieldMemory {self.ats_key} (success_count={self.success_count})>"
+
+
+class CompanyCredential(Base):
+    """Encrypted credentials for job application platforms.
+
+    Stores email/password per platform so the applicator can log in
+    automatically on repeat visits. Passwords are Fernet-encrypted.
+    """
+    __tablename__ = "company_credentials"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    platform_key = Column(String, unique=True, index=True)  # "workday", "generic:acme.com"
+    email = Column(String, nullable=False)
+    encrypted_password = Column(String, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_used = Column(DateTime)
+    login_success_count = Column(Integer, default=0)
+    notes = Column(Text)
+
+    def __repr__(self):
+        return f"<CompanyCredential {self.platform_key} ({self.email})>"

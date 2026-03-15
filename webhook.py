@@ -179,19 +179,27 @@ def _handle_field_answer(text: str) -> str:
     )
 
 
-def _handle_yes() -> str:
-    """Stage 1: Approve the last suggested job, then ask for instructions."""
+def _handle_yes(job_hash_prefix: str = None) -> str:
+    """Approve a job and immediately start applying."""
     from db.database import get_session
     from db.models import SuggestedJob
 
     session = get_session()
     try:
-        job = (
-            session.query(SuggestedJob)
-            .filter(SuggestedJob.status == "suggested")
-            .order_by(SuggestedJob.created_at.desc())
-            .first()
-        )
+        if job_hash_prefix:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.job_hash.like(f"{job_hash_prefix}%"))
+                .filter(SuggestedJob.status == "suggested")
+                .first()
+            )
+        else:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.status == "suggested")
+                .order_by(SuggestedJob.created_at.desc())
+                .first()
+            )
         if not job:
             return "❌ אין משרות ממתינות לאישור."
 
@@ -199,17 +207,19 @@ def _handle_yes() -> str:
         job.responded_at = datetime.now(timezone.utc)
         session.commit()
 
-        _set_conversation_state("awaiting_feedback", job_hash=job.job_hash)
-
-        return (
-            f"👍 *{job.company} — {job.title}*\n\n"
-            f"🎯 כל הערות לפני שאגיש?\n"
-            f"• כתוב הנחיה (למשל: _'הדגש Docker'_, _'השתמש ב-CV של DevOps'_)\n"
-            f"• *כן* — הגש ישירות\n"
-            f"• *המתן* — עצור, אגיש מאוחר יותר"
-        )
+        # Immediately start applying
+        job_hash = job.job_hash
+        company = job.company
+        title = job.title
+        apply_url = job.apply_url
+        description = job.description or ""
     finally:
         session.close()
+
+    _set_conversation_state("idle")
+    _spawn_apply_thread(job_hash, company, title, apply_url, description)
+
+    return f"⚙️ מגיש עכשיו ל-*{company}* — {title}...\nאעדכן כשזה יסתיים."
 
 
 def _handle_feedback(text: str) -> str:
@@ -261,8 +271,8 @@ def _handle_feedback(text: str) -> str:
     return confirm_msg
 
 
-def _handle_no() -> str:
-    """Reject the last suggested job permanently."""
+def _handle_no(job_hash_prefix: str = None) -> str:
+    """Reject a specific (or last) suggested job permanently."""
     from db.database import get_session
     from db.models import SuggestedJob
 
@@ -270,12 +280,20 @@ def _handle_no() -> str:
 
     session = get_session()
     try:
-        job = (
-            session.query(SuggestedJob)
-            .filter(SuggestedJob.status.in_(["suggested", "approved"]))
-            .order_by(SuggestedJob.created_at.desc())
-            .first()
-        )
+        if job_hash_prefix:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.job_hash.like(f"{job_hash_prefix}%"))
+                .filter(SuggestedJob.status.in_(["suggested", "approved"]))
+                .first()
+            )
+        else:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.status.in_(["suggested", "approved"]))
+                .order_by(SuggestedJob.created_at.desc())
+                .first()
+            )
         if not job:
             return "❌ אין משרות ממתינות."
 
@@ -288,8 +306,8 @@ def _handle_no() -> str:
         session.close()
 
 
-def _handle_skip() -> str:
-    """Snooze the last suggested job — re-suggest in 12 hours."""
+def _handle_skip(job_hash_prefix: str = None) -> str:
+    """Snooze a specific (or last) suggested job — re-suggest in 12 hours."""
     from db.database import get_session
     from db.models import SuggestedJob
 
@@ -297,12 +315,20 @@ def _handle_skip() -> str:
 
     session = get_session()
     try:
-        job = (
-            session.query(SuggestedJob)
-            .filter(SuggestedJob.status.in_(["suggested", "approved"]))
-            .order_by(SuggestedJob.created_at.desc())
-            .first()
-        )
+        if job_hash_prefix:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.job_hash.like(f"{job_hash_prefix}%"))
+                .filter(SuggestedJob.status.in_(["suggested", "approved"]))
+                .first()
+            )
+        else:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.status.in_(["suggested", "approved"]))
+                .order_by(SuggestedJob.created_at.desc())
+                .first()
+            )
         if not job:
             return "❌ אין משרות ממתינות."
 
@@ -412,7 +438,7 @@ def _handle_scan() -> str:
             session.add(suggested)
             new_count += 1
 
-            send_suggestion({**job_data, **result})
+            send_suggestion({**job_data, **result, "job_hash": job_hash})
 
         session.commit()
         session.close()
@@ -431,10 +457,23 @@ def _handle_scan() -> str:
 def webhook():
     incoming = (request.form.get("Body") or "").strip()
     sender = request.form.get("From") or ""
-    logger.info(f"Incoming WhatsApp from {sender}: {incoming!r}")
+    button_payload = (request.form.get("ButtonPayload") or "").strip()
+    logger.info(f"Incoming WhatsApp from {sender}: {incoming!r} payload={button_payload!r}")
 
     resp = MessagingResponse()
-    upper = incoming.upper().strip()
+    # Strip emojis and extra whitespace for command matching (button replies include emojis)
+    import re
+    cleaned = re.sub(r'[^\w\s\u0590-\u05FF]', '', incoming).strip()
+    upper = cleaned.upper()
+
+    # --- Parse button payload for job-specific actions ---
+    # ButtonPayload format: "yes_929c7b17", "no_33708af4", "skip_929c7b17"
+    button_action = None
+    button_job_hash = None
+    if button_payload and "_" in button_payload:
+        parts = button_payload.split("_", 1)
+        button_action = parts[0].upper()  # YES, NO, SKIP
+        button_job_hash = parts[1]         # 8-char hash prefix
 
     # --- Check conversation state first ---
     # If we're waiting for the user's feedback/instruction after YES,
@@ -443,8 +482,18 @@ def webhook():
     in_feedback = conv and conv.state == "awaiting_feedback"
     in_pending_field = conv and conv.state == "pending_field"
 
+    # --- Button clicks with specific job hash take priority ---
+    if button_action == "NO" and button_job_hash:
+        reply = _handle_no(job_hash_prefix=button_job_hash)
+
+    elif button_action == "SKIP" and button_job_hash:
+        reply = _handle_skip(job_hash_prefix=button_job_hash)
+
+    elif button_action == "YES" and button_job_hash:
+        reply = _handle_yes(job_hash_prefix=button_job_hash)
+
     # Global commands always work regardless of state
-    if upper in ("NO", "לא", "N"):
+    elif upper in ("NO", "לא", "N"):
         reply = _handle_no()
 
     elif upper in ("SKIP", "דלג", "S"):

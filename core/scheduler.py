@@ -123,7 +123,7 @@ def run_scan(force: bool = False) -> int:
             )
             session.add(suggested)
             new_count += 1
-            send_suggestion({**job_data, **result})
+            send_suggestion({**job_data, **result, "job_hash": job_hash})
 
         session.commit()
     except Exception as e:
@@ -203,7 +203,7 @@ def run_expiry_and_renotify() -> tuple[int, int]:
                 "role_summary": job.role_summary,
                 "requirements_summary": job.requirements_summary,
             }
-            send_suggestion(job_data)
+            send_suggestion({**job_data, "job_hash": job.job_hash})
             logger.info(f"Re-notified skipped job: {job.company} — {job.title}")
             renotified_count += 1
 

@@ -133,7 +133,7 @@ def scan():
             new_count += 1
 
             # Send WhatsApp suggestion card
-            job_card = {**job_data, **result}
+            job_card = {**job_data, **result, "job_hash": job_hash}
             ok = send_suggestion(job_card)
             if ok:
                 suggested_count += 1

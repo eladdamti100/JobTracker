@@ -425,7 +425,7 @@ def _parse_json_response(raw: str) -> dict:
 def _ask_grok_vision(client: OpenAI, screenshot_b64: str, prompt: str) -> str:
     """Send a screenshot to Groq Vision and get a text response."""
     response = client.chat.completions.create(
-        model="llama-3.2-90b-vision-preview",
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
         max_tokens=2000,
         messages=[{
             "role": "user",
@@ -1180,6 +1180,454 @@ def _find_navigation_button(page: Page, texts: list[str]) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Login / Signup / 2FA handling
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _handle_login_page(page, client: OpenAI, job_id: str, apply_url: str,
+                       step: int, result: dict) -> tuple[bool, int]:
+    """Handle a login page: try stored credentials, or sign up.
+
+    Returns (logged_in: bool, step: int).
+    """
+    from core.credential_manager import (
+        resolve_platform_key, get_credential, save_credential,
+        PLATFORMS_NO_AUTO_SIGNUP,
+    )
+
+    platform_key = resolve_platform_key(page.url)
+    step += 1
+    _step(step, f"Platform detected: {platform_key}")
+
+    # Try stored credentials first
+    cred = get_credential(platform_key)
+    if cred:
+        email, password = cred
+        step += 1
+        _step(step, f"Found stored credentials for {platform_key}, logging in...")
+        success, step = _perform_login(page, client, email, password,
+                                       platform_key, job_id, step, result)
+        if success:
+            return True, step
+        # Login failed — credentials might be wrong, try signup
+        _step(step, "Stored credentials failed, will try signup...")
+
+    # No credentials or login failed — try signup
+    if platform_key in PLATFORMS_NO_AUTO_SIGNUP:
+        step += 1
+        _step(step, f"Auto-signup disabled for {platform_key} — asking user...")
+        from core.notifier import send_whatsapp
+        send_whatsapp(
+            f"🔐 *{platform_key.title()}* requires login.\n"
+            f"Auto-signup is disabled for this platform.\n"
+            f"Please log in manually or provide credentials."
+        )
+        result["error"] = f"Login required for {platform_key} (no auto-signup)"
+        return False, step
+
+    # Attempt signup
+    success, step = _handle_signup_page(page, client, job_id, apply_url,
+                                        platform_key, step, result)
+    return success, step
+
+
+def _perform_login(page, client: OpenAI, email: str, password: str,
+                   platform_key: str, job_id: str, step: int,
+                   result: dict) -> tuple[bool, int]:
+    """Fill login form fields and submit. Returns (success, step)."""
+    from core.credential_manager import (
+        PLATFORM_SELECTORS, LOGIN_BUTTON_TEXTS, mark_login_success,
+    )
+
+    # Try platform-specific selectors first, then generic
+    selectors = PLATFORM_SELECTORS.get(platform_key, {})
+    email_sel = selectors.get("email", 'input[type="email"], input[name*="email"], '
+                              'input[name*="user"], input[autocomplete="username"], '
+                              'input[autocomplete="email"]')
+    pass_sel = selectors.get("password", 'input[type="password"], '
+                             'input[name*="pass"], input[autocomplete="current-password"]')
+
+    # Fill email
+    try:
+        email_field = page.locator(email_sel).first
+        if email_field.is_visible():
+            email_field.fill(email)
+            step += 1
+            _step(step, f"Filled email: {email}")
+    except Exception as e:
+        logger.warning(f"Could not fill email field: {e}")
+
+    # Fill password
+    try:
+        pass_field = page.locator(pass_sel).first
+        if pass_field.is_visible():
+            pass_field.fill(password)
+            step += 1
+            _step(step, "Filled password")
+    except Exception as e:
+        logger.warning(f"Could not fill password field: {e}")
+
+    # Click login button
+    signin_sel = selectors.get("signin")
+    clicked = False
+    if signin_sel:
+        try:
+            btn = page.locator(signin_sel).first
+            if btn.is_visible():
+                btn.click()
+                clicked = True
+        except Exception:
+            pass
+
+    if not clicked:
+        for text in LOGIN_BUTTON_TEXTS:
+            try:
+                btn = page.get_by_role("button", name=text)
+                if btn.count() > 0 and btn.first.is_visible():
+                    btn.first.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+    if not clicked:
+        # Fallback: try any submit button
+        try:
+            submit = page.locator('input[type="submit"], button[type="submit"]').first
+            if submit.is_visible():
+                submit.click()
+                clicked = True
+        except Exception:
+            pass
+
+    if not clicked:
+        step += 1
+        _step(step, "Could not find login button")
+        return False, step
+
+    step += 1
+    _step(step, "Clicked login button, waiting for response...")
+
+    # Wait for navigation
+    page.wait_for_timeout(4000)
+    shot = _screenshot(page, job_id, "login_result")
+    result["screenshots"].append(str(shot))
+
+    # Check if login succeeded
+    page_state = _ask_grok_vision_for_page_state(client, shot)
+    status = page_state.get("status", "unknown")
+
+    if status == "login":
+        # Still on login page — credentials were wrong
+        step += 1
+        _step(step, "Login failed — still on login page")
+        return False, step
+
+    if status == "2fa":
+        step += 1
+        _step(step, "2FA required — asking user for code...")
+        return _handle_2fa(page, client, job_id, platform_key, step, result)
+
+    # Login succeeded
+    step += 1
+    _step(step, f"Login successful for {platform_key}")
+    mark_login_success(platform_key)
+    return True, step
+
+
+def _handle_signup_page(page, client: OpenAI, job_id: str, apply_url: str,
+                        platform_key: str, step: int,
+                        result: dict) -> tuple[bool, int]:
+    """Navigate to signup, create account, store credentials. Returns (success, step)."""
+    from core.credential_manager import (
+        SIGNUP_LINK_TEXTS, PLATFORM_SELECTORS, generate_secure_password,
+        save_credential,
+    )
+
+    # Find and click signup link
+    step += 1
+    _step(step, "Looking for signup/register link...")
+
+    selectors = PLATFORM_SELECTORS.get(platform_key, {})
+    create_sel = selectors.get("create_account")
+    clicked = False
+
+    if create_sel:
+        try:
+            link = page.locator(create_sel).first
+            if link.is_visible():
+                link.click()
+                clicked = True
+        except Exception:
+            pass
+
+    if not clicked:
+        for text in SIGNUP_LINK_TEXTS:
+            try:
+                link = page.get_by_role("link", name=text)
+                if link.count() > 0 and link.first.is_visible():
+                    link.first.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+    if not clicked:
+        # Try broader text matching
+        for text in SIGNUP_LINK_TEXTS:
+            try:
+                link = page.locator(f'a:has-text("{text}")').first
+                if link.is_visible():
+                    link.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+    if not clicked:
+        step += 1
+        _step(step, "Could not find signup link")
+        result["error"] = "No signup link found on login page"
+        return False, step
+
+    # Wait for signup page
+    page.wait_for_timeout(3000)
+    step += 1
+    _step(step, "Signup page loaded")
+
+    shot = _screenshot(page, job_id, "signup_page")
+    result["screenshots"].append(str(shot))
+
+    # Get user email from answers database
+    answers = _get_answers()
+    user_email = answers.get("email", "")
+    if not user_email:
+        logger.error("No email in default_answers.yaml for signup")
+        result["error"] = "No email configured for signup"
+        return False, step
+
+    # Generate secure password
+    new_password = generate_secure_password()
+    step += 1
+    _step(step, f"Generated secure password for signup")
+
+    # Fill signup form fields using DOM selectors
+    # Email
+    for sel in ['input[type="email"]', 'input[name*="email"]',
+                'input[autocomplete="email"]', 'input[id*="email"]']:
+        try:
+            field = page.locator(sel).first
+            if field.is_visible():
+                field.fill(user_email)
+                _step(step, f"Filled signup email: {user_email}")
+                break
+        except Exception:
+            continue
+
+    # Password
+    pass_fields = page.locator('input[type="password"]')
+    pass_count = pass_fields.count()
+    if pass_count >= 1:
+        try:
+            pass_fields.nth(0).fill(new_password)
+            step += 1
+            _step(step, "Filled password")
+        except Exception as e:
+            logger.warning(f"Could not fill password: {e}")
+
+    # Confirm password (second password field)
+    if pass_count >= 2:
+        try:
+            pass_fields.nth(1).fill(new_password)
+            step += 1
+            _step(step, "Filled confirm password")
+        except Exception as e:
+            logger.warning(f"Could not fill confirm password: {e}")
+
+    # Fill name fields if present
+    first_name = answers.get("first_name", "")
+    last_name = answers.get("last_name", "")
+    for sel, val in [
+        ('input[name*="first"], input[id*="first"]', first_name),
+        ('input[name*="last"], input[id*="last"]', last_name),
+    ]:
+        if val:
+            try:
+                field = page.locator(sel).first
+                if field.is_visible():
+                    field.fill(val)
+            except Exception:
+                pass
+
+    # Check consent/terms checkboxes
+    _check_consent_checkboxes(page, step)
+
+    # Click signup button
+    signup_clicked = False
+    for text in ["Sign Up", "Create Account", "Register", "Create",
+                 "Submit", "Next", "Continue"]:
+        try:
+            btn = page.get_by_role("button", name=text)
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click()
+                signup_clicked = True
+                break
+        except Exception:
+            continue
+
+    if not signup_clicked:
+        try:
+            submit = page.locator('input[type="submit"], button[type="submit"]').first
+            if submit.is_visible():
+                submit.click()
+                signup_clicked = True
+        except Exception:
+            pass
+
+    if not signup_clicked:
+        step += 1
+        _step(step, "Could not find signup button")
+        result["error"] = "No signup button found"
+        return False, step
+
+    # Wait and check result
+    page.wait_for_timeout(4000)
+    shot = _screenshot(page, job_id, "signup_result")
+    result["screenshots"].append(str(shot))
+
+    page_state = _ask_grok_vision_for_page_state(client, shot)
+    status = page_state.get("status", "unknown")
+
+    if status == "login":
+        # Redirected back to login — signup might have worked, try logging in
+        step += 1
+        _step(step, "Redirected to login after signup — trying to log in...")
+        save_credential(platform_key, user_email, new_password)
+        return _perform_login(page, client, user_email, new_password,
+                              platform_key, job_id, step, result)
+
+    if status in ("error", "unknown"):
+        msg = page_state.get("message", "Unknown signup error")
+        # Check if "already exists" type error
+        page_text = page.inner_text("body")[:500].lower()
+        if any(kw in page_text for kw in ["already exists", "already registered",
+                                           "account exists", "already have"]):
+            step += 1
+            _step(step, "Account already exists — asking user for credentials via WhatsApp")
+            from core.notifier import send_whatsapp
+            send_whatsapp(
+                f"🔐 Account already exists on *{platform_key}*.\n"
+                f"Email: {user_email}\n"
+                f"Please reply with your password, or log in manually."
+            )
+            result["error"] = f"Account already exists on {platform_key}"
+            return False, step
+        step += 1
+        _step(step, f"Signup error: {msg}")
+        result["error"] = f"Signup failed: {msg}"
+        return False, step
+
+    # Signup succeeded
+    step += 1
+    _step(step, f"Signup successful for {platform_key}")
+    save_credential(platform_key, user_email, new_password)
+    return True, step
+
+
+def _handle_2fa(page, client: OpenAI, job_id: str, platform_key: str,
+                step: int, result: dict) -> tuple[bool, int]:
+    """Ask user for 2FA code via WhatsApp, enter it, and submit."""
+    from core.notifier import send_whatsapp
+    from db.database import get_session
+    from db.models import ConversationState
+    import time
+
+    # Ask user via WhatsApp
+    send_whatsapp(
+        f"🔐 *2FA code needed* for {platform_key}.\n"
+        f"Please reply with the verification code."
+    )
+
+    # Set conversation state to pending_field
+    session = get_session()
+    try:
+        row = session.query(ConversationState).first()
+        if row:
+            row.state = "pending_field"
+            row.pending_field_label = "2FA verification code"
+            row.field_answer = None
+            row.updated_at = datetime.now(timezone.utc)
+            session.commit()
+    finally:
+        session.close()
+
+    # Poll for answer (5 min timeout)
+    timeout = 300
+    start = time.time()
+    code = None
+    while time.time() - start < timeout:
+        time.sleep(5)
+        s = get_session()
+        try:
+            row = s.query(ConversationState).first()
+            if row and row.state == "field_answer_ready" and row.field_answer:
+                code = row.field_answer.strip()
+                row.state = "idle"
+                row.field_answer = None
+                s.commit()
+                break
+        finally:
+            s.close()
+
+    if not code:
+        step += 1
+        _step(step, "2FA timeout — no code received")
+        result["error"] = "2FA code not provided within timeout"
+        return False, step
+
+    # Fill code into the page
+    step += 1
+    _step(step, f"Entering 2FA code: {code[:2]}****")
+
+    # Try common 2FA input selectors
+    for sel in ['input[name*="code"]', 'input[name*="otp"]', 'input[name*="mfa"]',
+                'input[name*="token"]', 'input[name*="verify"]',
+                'input[type="text"]', 'input[type="number"]']:
+        try:
+            field = page.locator(sel).first
+            if field.is_visible():
+                field.fill(code)
+                break
+        except Exception:
+            continue
+
+    # Click submit/verify
+    for text in ["Verify", "Submit", "Continue", "Confirm"]:
+        try:
+            btn = page.get_by_role("button", name=text)
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click()
+                break
+        except Exception:
+            continue
+
+    page.wait_for_timeout(3000)
+    shot = _screenshot(page, job_id, "2fa_result")
+    result["screenshots"].append(str(shot))
+
+    page_state = _ask_grok_vision_for_page_state(client, shot)
+    if page_state.get("status") in ("2fa", "login"):
+        step += 1
+        _step(step, "2FA verification failed")
+        return False, step
+
+    step += 1
+    _step(step, "2FA verified successfully")
+    from core.credential_manager import mark_login_success
+    mark_login_success(platform_key)
+    return True, step
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Main entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1323,12 +1771,59 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
             _step(step, "Checking for popups or cookie banners...")
             _dismiss_popups(page)
 
+            # ── PHASE 2b: Check if landing page is a login/signup page ──
+            initial_state = _ask_grok_vision_for_page_state(client, shot)
+            initial_status = initial_state.get("status", "unknown")
+
+            if initial_status in ("login", "signup"):
+                step += 1
+                _step(step, f"Landing page is a {initial_status} page — handling auth...")
+                logged_in, step = _handle_login_page(
+                    page, client, job_id, apply_url, step, result)
+                if not logged_in:
+                    result["error"] = result.get("error") or "Login/signup failed"
+                    browser.close()
+                    return result
+                # Navigate back to the job page after login
+                step += 1
+                _step(step, f"Navigating back to job page: {apply_url}")
+                page.goto(apply_url, wait_until="load", timeout=60000)
+                page.wait_for_timeout(3000)
+                shot = _screenshot(page, job_id, "01b_after_login")
+                result["screenshots"].append(str(shot))
+            elif initial_status == "2fa":
+                step += 1
+                _step(step, "Landing page requires 2FA...")
+                from core.credential_manager import resolve_platform_key
+                platform_key = resolve_platform_key(page.url)
+                success_2fa, step = _handle_2fa(
+                    page, client, job_id, platform_key, step, result)
+                if not success_2fa:
+                    result["error"] = "2FA verification failed"
+                    browser.close()
+                    return result
+                page.goto(apply_url, wait_until="load", timeout=60000)
+                page.wait_for_timeout(3000)
+            elif initial_status == "captcha":
+                step += 1
+                _step(step, "CAPTCHA detected — cannot proceed automatically")
+                result["error"] = "CAPTCHA detected on landing page"
+                browser.close()
+                return result
+
             # ── PHASE 3: Detect & click Apply button if needed ───────────
             step += 1
             # LinkedIn job listing pages always have an Apply button to click,
             # even though they contain inputs (search bar) — never skip Apply search on LinkedIn
             on_linkedin_job_page = "linkedin.com/jobs/view/" in page.url
-            form_already_visible = (not on_linkedin_job_page) and _has_visible_form(page)
+            # If PHASE 2b Vision found an Apply/button, trust Vision over DOM form check
+            # (avoids false positives from search bars being detected as form fields)
+            vision_says_has_button = (initial_status == "has_button")
+            form_already_visible = (
+                (not on_linkedin_job_page) and
+                (not vision_says_has_button) and
+                _has_visible_form(page)
+            )
 
             if form_already_visible:
                 _step(step, "Form fields already visible -- skipping Apply button search")
@@ -1343,6 +1838,52 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                     shot = _screenshot(page, job_id, "02_after_apply_click")
                     result["screenshots"].append(str(shot))
                     _step(step, f"Screenshot after Apply click -> {shot.name}")
+
+                    # ── Check if Apply button led to a login page ──
+                    post_apply_state = _ask_grok_vision_for_page_state(client, shot)
+                    post_apply_status = post_apply_state.get("status", "unknown")
+                    if post_apply_status in ("login", "signup"):
+                        step += 1
+                        _step(step, f"Apply button led to {post_apply_status} page — handling auth...")
+                        logged_in, step = _handle_login_page(
+                            page, client, job_id, apply_url, step, result)
+                        if logged_in:
+                            step += 1
+                            _step(step, "Logged in — navigating back to job page to re-apply...")
+                            page.goto(apply_url, wait_until="load", timeout=60000)
+                            page.wait_for_timeout(3000)
+                            # Re-click Apply now that we're logged in
+                            clicked2, step = _find_and_click_apply_button_on_page(
+                                page, client, job_id, step + 1, result)
+                            if clicked2:
+                                step = _wait_for_form(page, step + 1)
+                                page.wait_for_timeout(2000)
+                                # Check if we landed on login AGAIN
+                                recheck_shot = _screenshot(page, job_id, "02c_recheck")
+                                result["screenshots"].append(str(recheck_shot))
+                                recheck_state = _ask_grok_vision_for_page_state(client, recheck_shot)
+                                if recheck_state.get("status") in ("login", "signup"):
+                                    step += 1
+                                    _step(step, "Still on login — using stored credentials...")
+                                    from core.credential_manager import get_credential, resolve_platform_key
+                                    pk = resolve_platform_key(page.url)
+                                    cred = get_credential(pk)
+                                    if cred:
+                                        login_ok, step = _perform_login(
+                                            page, client, cred[0], cred[1],
+                                            pk, job_id, step, result)
+                                        if login_ok:
+                                            # After login, Amazon may redirect to the application form directly
+                                            page.wait_for_timeout(3000)
+                                    else:
+                                        _step(step, "No credentials found — cannot proceed")
+                                        result["error"] = "Login required but no credentials available"
+                                        browser.close()
+                                        return result
+                        else:
+                            result["error"] = result.get("error") or "Login failed after Apply click"
+                            browser.close()
+                            return result
 
                     # ── LinkedIn Easy Apply: modal opens in the same tab ──
                     if on_linkedin_job_page and len(context.pages) == 1:
@@ -1410,7 +1951,8 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                         guidance = _ask_grok_vision_for_page_state(client, shot)
                         _step(step + 1, f"Groq says: {guidance.get('message', 'unknown')}")
                         step += 1
-                        if guidance.get("status") == "has_button":
+                        guidance_status = guidance.get("status", "unknown")
+                        if guidance_status == "has_button":
                             btn = guidance.get("button_text", "Apply")
                             _step(step, f"Groq found button: \"{btn}\" -- clicking")
                             try:
@@ -1419,6 +1961,15 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                                 step = _wait_for_form(page, step + 1)
                             except Exception as e:
                                 _step(step, f"Could not click \"{btn}\": {e}")
+                        elif guidance_status in ("login", "signup"):
+                            _step(step, f"Page requires {guidance_status} — handling auth...")
+                            logged_in, step = _handle_login_page(
+                                page, client, job_id, apply_url, step, result)
+                            if logged_in:
+                                step += 1
+                                _step(step, "Logged in — navigating back to job page...")
+                                page.goto(apply_url, wait_until="load", timeout=60000)
+                                page.wait_for_timeout(3000)
 
             # ── PHASE 4: Generate cover letter ───────────────────────────
             step += 1
@@ -1492,9 +2043,44 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                     step += 1
                     _step(step, "No fields detected -- checking DOM...")
                     if not _has_visible_form(page):
-                        _step(step + 1, "No form in DOM. Page may require login.")
-                        result["error"] = "No form fields found on page"
-                        break
+                        # Check if this is a login/signup page
+                        step += 1
+                        no_form_shot = _screenshot(page, job_id, f"03_page{page_num}_no_form")
+                        result["screenshots"].append(str(no_form_shot))
+                        no_form_state = _ask_grok_vision_for_page_state(client, no_form_shot)
+                        no_form_status = no_form_state.get("status", "unknown")
+
+                        if no_form_status in ("login", "signup"):
+                            _step(step, f"Page is a {no_form_status} page — handling auth...")
+                            logged_in, step = _handle_login_page(
+                                page, client, job_id, apply_url, step, result)
+                            if logged_in:
+                                step += 1
+                                _step(step, "Logged in — navigating back to job page...")
+                                page.goto(apply_url, wait_until="load", timeout=60000)
+                                page.wait_for_timeout(3000)
+                                page_num -= 1  # retry this form page
+                                continue
+                            else:
+                                result["error"] = result.get("error") or "Login/signup failed"
+                                break
+                        elif no_form_status == "2fa":
+                            from core.credential_manager import resolve_platform_key
+                            pk = resolve_platform_key(page.url)
+                            success_2fa, step = _handle_2fa(
+                                page, client, job_id, pk, step, result)
+                            if success_2fa:
+                                page.goto(apply_url, wait_until="load", timeout=60000)
+                                page.wait_for_timeout(3000)
+                                page_num -= 1
+                                continue
+                            else:
+                                result["error"] = "2FA verification failed"
+                                break
+                        else:
+                            _step(step, "No form in DOM. Page may require login.")
+                            result["error"] = "No form fields found on page"
+                            break
                     else:
                         _step(step + 1, "DOM has fields -- retrying Vision...")
                         page.evaluate("window.scrollTo(0, 0)")
@@ -1672,13 +2258,33 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                         has_errors = any(phrase in page_text for phrase in error_phrases)
 
                         if has_errors and not text_success:
+                            # Check if this is actually a login page, not a validation error
                             step += 1
-                            _step(step, "Validation errors detected on page after submit")
-                            shot = _screenshot(page, job_id, "06_validation_error")
-                            result["screenshots"].append(str(shot))
-                            result["error"] = "Post-submit validation errors detected"
-                            result["application_result"] = "failed"
-                            break
+                            post_shot = _screenshot(page, job_id, "06_post_submit_check")
+                            result["screenshots"].append(str(post_shot))
+                            post_state = _ask_grok_vision_for_page_state(client, post_shot)
+                            post_status = post_state.get("status", "unknown")
+
+                            if post_status in ("login", "signup"):
+                                _step(step, f"Post-submit page is a {post_status} page — handling auth...")
+                                logged_in, step = _handle_login_page(
+                                    page, client, job_id, apply_url, step, result)
+                                if logged_in:
+                                    step += 1
+                                    _step(step, "Logged in — restarting application...")
+                                    page.goto(apply_url, wait_until="load", timeout=60000)
+                                    page.wait_for_timeout(3000)
+                                    page_num = 0
+                                    continue
+                                else:
+                                    result["error"] = result.get("error") or "Login failed after Apply click"
+                                    result["application_result"] = "failed"
+                                    break
+                            else:
+                                _step(step, "Validation errors detected on page after submit")
+                                result["error"] = "Post-submit validation errors detected"
+                                result["application_result"] = "failed"
+                                break
 
                         # Take success/post-submit screenshot
                         step += 1
@@ -1754,6 +2360,41 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                             continue
                         except Exception as e:
                             _step(step, f"Could not click \"{btn}\": {e}")
+                    elif status in ("login", "signup"):
+                        step += 1
+                        _step(step, f"Session expired — {status} page detected mid-form")
+                        logged_in, step = _handle_login_page(
+                            page, client, job_id, apply_url, step, result)
+                        if logged_in:
+                            step += 1
+                            _step(step, "Re-logged in — navigating back to job page...")
+                            page.goto(apply_url, wait_until="load", timeout=60000)
+                            page.wait_for_timeout(3000)
+                            page_num = 0  # restart form from page 1
+                            continue
+                        else:
+                            result["error"] = result.get("error") or "Re-login failed mid-form"
+                            break
+                    elif status == "2fa":
+                        step += 1
+                        _step(step, "2FA required mid-form...")
+                        from core.credential_manager import resolve_platform_key
+                        pk = resolve_platform_key(page.url)
+                        success_2fa, step = _handle_2fa(
+                            page, client, job_id, pk, step, result)
+                        if success_2fa:
+                            page.goto(apply_url, wait_until="load", timeout=60000)
+                            page.wait_for_timeout(3000)
+                            page_num = 0
+                            continue
+                        else:
+                            result["error"] = "2FA verification failed mid-form"
+                            break
+                    elif status == "captcha":
+                        step += 1
+                        _step(step, "CAPTCHA detected — cannot proceed")
+                        result["error"] = "CAPTCHA challenge encountered"
+                        break
                     else:
                         _step(step + 1, f"Unknown page state ({status}). Stopping.")
                         result["error"] = "Could not find Next/Submit button"
@@ -1854,9 +2495,12 @@ def _ask_grok_vision_for_page_state(client: OpenAI, screenshot_path: Path) -> di
             "- A success/confirmation page (application submitted)?\n"
             "- An error page?\n"
             "- A page with a button to proceed (what text)?\n"
-            "- A login page?\n"
+            "- A login page (email/password fields, sign-in form)?\n"
+            "- A signup/registration page (create account form)?\n"
+            "- A 2FA/MFA verification page (code input, OTP)?\n"
+            "- A CAPTCHA challenge page?\n"
             "- Something else?\n\n"
-            "Respond with JSON: {\"status\": \"success|error|has_button|login|unknown\", "
+            "Respond with JSON: {\"status\": \"success|error|has_button|login|signup|2fa|captcha|unknown\", "
             "\"button_text\": \"...\", \"message\": \"brief description\"}"
         )
         return _parse_json_response(raw)
