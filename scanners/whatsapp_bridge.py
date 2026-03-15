@@ -2,7 +2,7 @@
 WhatsApp Bridge — Flask server on port 5001.
 
 Receives job URLs from whatsapp_group.js, scrapes them with Playwright,
-scores with Claude, saves to DB, and notifies via WhatsApp if relevant.
+scores with Claude, saves to suggested_jobs, and notifies via WhatsApp.
 
 Run: python scanners/whatsapp_bridge.py
 """
@@ -40,46 +40,35 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 
 def _extract_from_url(url: str) -> tuple[str, str]:
-    """Extract title and company directly from the URL structure before scraping.
-
-    Returns (title, company) — both may be empty strings if not determinable.
-    """
+    """Extract title and company directly from the URL structure before scraping."""
     parsed = urlparse(url)
     host = parsed.hostname or ""
     path = parsed.path
 
-    # ── Workday: proofpoint.wd5.myworkdayjobs.com/…/Job-Title_RXXXXX ─────
     if "myworkdayjobs.com" in host:
         company = host.split(".")[0].capitalize()
-        # Last path segment: "Automation-Engineer-Intern_R13779" → title
         slug = path.rstrip("/").split("/")[-1]
-        slug = re.sub(r"_[A-Z0-9]+$", "", slug)   # strip requisition ID
+        slug = re.sub(r"_[A-Z0-9]+$", "", slug)
         title = slug.replace("-", " ").replace("%20", " ").title()
         return title, company
 
-    # ── Breezy: sefaria.breezy.hr/p/HASH-job-title-here ─────────────────
     if "breezy.hr" in host:
         company = host.split(".")[0].capitalize()
         slug = path.rstrip("/").split("/")[-1]
-        slug = re.sub(r"^[a-f0-9]{12,}-", "", slug)   # strip leading hash
-        # Strip trailing location keywords
+        slug = re.sub(r"^[a-f0-9]{12,}-", "", slug)
         slug = re.sub(r"-(israel|tel-aviv|ramat-gan|remote)$", "", slug, flags=re.IGNORECASE)
         title = slug.replace("-", " ").title()
         return title, company
 
-    # ── Greenhouse: company.greenhouse.io/jobs/… ─────────────────────────
     if "greenhouse.io" in host:
         company = host.split(".")[0].capitalize()
         return "", company
 
-    # ── Lever: jobs.lever.co/company/… ──────────────────────────────────
     if "lever.co" in host:
         parts = [p for p in path.split("/") if p]
         company = parts[0].replace("-", " ").title() if parts else ""
         return "", company
 
-    # ── LinkedIn: linkedin.com/jobs/view/NUMERIC_ID ──────────────────────
-    # Can't extract title from URL alone — rely on page scraping
     if "linkedin.com" in host:
         return "", ""
 
@@ -87,14 +76,9 @@ def _extract_from_url(url: str) -> tuple[str, str]:
 
 
 async def scrape_job_page(url: str) -> dict:
-    """Load a job URL with Playwright and extract title, company, and body text.
-
-    Uses URL-based extraction as primary source for title/company, falls back
-    to page content (h1, og:title, og:site_name).
-    """
+    """Load a job URL with Playwright and extract title, company, and body text."""
     from playwright.async_api import async_playwright
 
-    # Pre-extract from URL structure (fast, no network needed)
     url_title, url_company = _extract_from_url(url)
 
     async with async_playwright() as p:
@@ -111,7 +95,6 @@ async def scrape_job_page(url: str) -> dict:
 
             body = await page.evaluate("() => document.body.innerText")
 
-            # Extract title: h1 first, then og:title, then page title
             scraped_title = await page.evaluate("""() => {
                 const h1 = document.querySelector('h1');
                 const og = document.querySelector('meta[property="og:title"]');
@@ -121,18 +104,15 @@ async def scrape_job_page(url: str) -> dict:
                        title || '';
             }""")
 
-            # Extract company: og:site_name, application-name, or nothing
             scraped_company = await page.evaluate("""() => {
                 const og = document.querySelector('meta[property="og:site_name"]');
                 const app = document.querySelector('meta[name="application-name"]');
                 return (og && og.content.trim()) || (app && app.content.trim()) || '';
             }""")
 
-            # Resolution order: URL-derived > page-scraped
             title = url_title or scraped_title or ""
             company = url_company or scraped_company or ""
 
-            # Clean up generic page titles that are just the site name
             generic_titles = {"careers", "jobs", "career", "job board", "apply now", ""}
             if title.lower().strip() in generic_titles:
                 title = url_title or scraped_title or ""
@@ -155,36 +135,36 @@ async def scrape_job_page(url: str) -> dict:
 # Processing pipeline
 # ---------------------------------------------------------------------------
 
-def _make_job_id(url: str) -> str:
-    return f"WA-{hashlib.md5(url.encode()).hexdigest()[:10].upper()}"
-
-
 def _url_exists(url: str) -> bool:
+    """Check if URL already exists in suggested_jobs or applications."""
     from db.database import get_session, init_db
-    from db.models import Job
+    from db.models import SuggestedJob, Application
 
     init_db()
     session = get_session()
     try:
-        return session.query(Job).filter(Job.apply_url == url).first() is not None
+        in_suggested = session.query(SuggestedJob).filter(SuggestedJob.apply_url == url).first()
+        if in_suggested:
+            return True
+        in_applied = session.query(Application).filter(Application.apply_url == url).first()
+        return in_applied is not None
     finally:
         session.close()
 
 
 async def _process(url: str, group_name: str, hint_title: str = "", hint_company: str = ""):
-    """Full pipeline: scrape → score → save → notify."""
+    """Full pipeline: scrape → score → save to suggested_jobs → notify via WhatsApp."""
     import yaml
     from core.analyzer import score_job, should_keep
-    from core.notifier import send_job_cards
-    from db.database import get_session, init_db
-    from db.models import Job
+    from core.notifier import send_suggestion
+    from db.database import get_session, init_db, is_duplicate
+    from db.models import SuggestedJob, make_job_hash
 
     logger.info(f"Processing URL from '{group_name}': {url}")
 
     # Scrape
     scraped = await scrape_job_page(url)
     title = hint_title or scraped["title"] or "Unknown Position"
-    # Never fall back to the WhatsApp group name as company
     company = hint_company or scraped["company"] or urlparse(url).hostname or "Unknown Company"
     description = scraped["description"]
 
@@ -192,8 +172,14 @@ async def _process(url: str, group_name: str, hint_title: str = "", hint_company
         logger.warning(f"Empty description for {url}, skipping")
         return
 
+    # Check duplicate by job_hash
+    job_hash = make_job_hash(company, title, url)
+    if is_duplicate(job_hash):
+        logger.info(f"[SCAN] Duplicate hash, skipping: {company} — {title}")
+        return
+
     job_data = {
-        "job_id": _make_job_id(url),
+        "job_id": f"WA-{hashlib.md5(url.encode()).hexdigest()[:10].upper()}",
         "title": title,
         "company": company,
         "location": "ישראל",
@@ -215,27 +201,31 @@ async def _process(url: str, group_name: str, hint_title: str = "", hint_company
         logger.error(f"Claude scoring failed for {url}: {e}")
         return
 
-    enriched = {**job_data, **result}
+    if not should_keep(result):
+        logger.info(f"[SCAN] Below threshold (score={result.get('score')}, level={result.get('level')}): {title}")
+        return
 
-    # Save to DB
+    # Save to suggested_jobs
     init_db()
     session = get_session()
     try:
-        # Check again inside transaction (race condition guard)
-        if session.query(Job).filter(Job.apply_url == url).first():
+        # Race condition guard
+        if session.query(SuggestedJob).filter_by(job_hash=job_hash).first():
             logger.info(f"Duplicate (race), skipping: {url}")
             return
 
-        db_job = Job(
-            job_id=job_data["job_id"],
-            title=title,
+        suggested = SuggestedJob(
+            job_hash=job_hash,
             company=company,
+            title=title,
+            source="WhatsApp",
+            apply_url=url,
             location=job_data["location"],
             description=description,
-            apply_url=url,
             date_posted=job_data["date_posted"],
             salary=None,
             score=result["score"],
+            reason=result.get("reason"),
             level=result.get("level"),
             role_type=result.get("role_type"),
             tech_stack_match=result.get("tech_stack_match"),
@@ -243,23 +233,18 @@ async def _process(url: str, group_name: str, hint_title: str = "", hint_company
             apply_strategy=result.get("apply_strategy"),
             role_summary=result.get("role_summary"),
             requirements_summary=result.get("requirements_summary"),
-            status="scored",
+            status="suggested",
         )
-        session.add(db_job)
+        session.add(suggested)
+        session.commit()
 
-        if should_keep(result):
-            db_job.status = "notified"
-            session.commit()
-            send_job_cards([enriched])
-            logger.success(
-                f"Sent to WhatsApp: '{title}' @ {company} "
-                f"[{result.get('level')}] score={result['score']}/10"
-            )
-        else:
-            session.commit()
-            logger.info(
-                f"Skipped (score={result['score']}, level={result.get('level')}): {title}"
-            )
+        # Send WhatsApp suggestion
+        enriched = {**job_data, **result}
+        send_suggestion(enriched)
+        logger.success(
+            f"Suggested via WhatsApp: '{title}' @ {company} "
+            f"[{result.get('level')}] score={result['score']}/10"
+        )
     except Exception as e:
         logger.error(f"DB save failed: {e}")
         session.rollback()

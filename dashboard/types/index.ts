@@ -1,32 +1,29 @@
-export type JobStatus =
-  | "new"
-  | "scored"
-  | "notified"
+// Suggested Jobs
+export type SuggestedStatus =
+  | "suggested"
   | "approved"
-  | "applying"
-  | "applied"
-  | "failed"
-  | "in_review"
   | "rejected"
-  | "interview"
-  | "next_stage"
-  | "accepted";
+  | "skipped"
+  | "expired"
+  | "applied";
 
 export type JobLevel = "student" | "junior" | "senior";
 export type JobSource = "HireMeTech" | "LinkedIn" | "WhatsApp" | "Unknown";
-export type ReferralType = "referral" | "regular" | null;
 
-export interface Job {
+// Applications
+export type ApplicationStatus = "success" | "failed" | "pending";
+
+export interface SuggestedJob {
   id: number;
-  job_id: string;
-  title: string;
+  job_hash: string;
   company: string;
+  title: string;
+  source: JobSource | string;
+  apply_url: string | null;
   location: string | null;
   description: string | null;
-  apply_url: string | null;
   date_posted: string | null;
   salary: string | null;
-  source: JobSource;
   // Scoring
   score: number | null;
   reason: string | null;
@@ -38,31 +35,56 @@ export interface Job {
   role_summary: string | null;
   requirements_summary: string | null;
   // Lifecycle
-  status: JobStatus;
+  status: SuggestedStatus;
+  // Timestamps
+  created_at: string | null;
+  expires_at: string | null;
+  responded_at: string | null;
+}
+
+export interface Application {
+  id: number;
+  job_hash: string;
+  company: string;
+  title: string;
+  source: string | null;
+  apply_url: string | null;
+  // Application details
+  applied_at: string | null;
+  application_method: string | null;
+  application_result: string | null;
+  status: ApplicationStatus;
+  // Evidence
+  screenshot_path: string | null;
   cover_letter_used: string | null;
   error_message: string | null;
-  // Dashboard fields
-  notes: string | null;
-  referral_type: ReferralType;
-  referral_url: string | null;
-  // Timestamps
-  found_at: string | null;
-  notified_at: string | null;
-  applied_at: string | null;
-  status_updated_at: string | null;
 }
 
-export interface Stats {
-  total: number;
-  by_status: Record<string, number>;
-  by_level: Record<string, number>;
-  by_source: Record<string, number>;
-  recent: Job[];
-}
-
-export interface JobsResponse {
-  jobs: Job[];
+export interface SuggestedJobsResponse {
+  jobs: SuggestedJob[];
   total: number;
   page: number;
   per_page: number;
+}
+
+export interface ApplicationsResponse {
+  applications: Application[];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
+export interface Stats {
+  suggested: {
+    total: number;
+    by_status: Record<string, number>;
+    by_level: Record<string, number>;
+    by_source: Record<string, number>;
+    pending: SuggestedJob[];
+  };
+  applications: {
+    total: number;
+    by_status: Record<string, number>;
+    recent: Application[];
+  };
 }

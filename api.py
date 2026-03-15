@@ -1,10 +1,9 @@
 """JobTracker REST API — serves data to the Next.js dashboard."""
 
 import sys
-import io
 if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import os
 from datetime import datetime, timezone
@@ -16,7 +15,7 @@ from flask_cors import CORS
 from sqlalchemy import func
 
 from db.database import init_db, get_session
-from db.models import Job
+from db.models import SuggestedJob, Application
 
 load_dotenv()
 
@@ -30,29 +29,18 @@ init_db()
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _infer_source(job_id: str) -> str:
-    if job_id.startswith("HMT-"):
-        return "HireMeTech"
-    if job_id.startswith("LI-"):
-        return "LinkedIn"
-    if job_id.startswith("WA-"):
-        return "WhatsApp"
-    return "Unknown"
-
-
-def _job_to_dict(job: Job) -> dict:
-    source = job.source or _infer_source(job.job_id)
+def _suggested_to_dict(job: SuggestedJob) -> dict:
     return {
         "id": job.id,
-        "job_id": job.job_id,
-        "title": job.title,
+        "job_hash": job.job_hash,
         "company": job.company,
+        "title": job.title,
+        "source": job.source,
+        "apply_url": job.apply_url,
         "location": job.location,
         "description": job.description,
-        "apply_url": job.apply_url,
         "date_posted": job.date_posted,
         "salary": job.salary,
-        "source": source,
         # Scoring
         "score": job.score,
         "reason": job.reason,
@@ -65,22 +53,35 @@ def _job_to_dict(job: Job) -> dict:
         "requirements_summary": job.requirements_summary,
         # Lifecycle
         "status": job.status,
-        "cover_letter_used": job.cover_letter_used,
-        "error_message": job.error_message,
-        # Dashboard fields
-        "notes": job.notes,
-        "referral_type": job.referral_type,
-        "referral_url": job.referral_url,
         # Timestamps
-        "found_at": job.found_at.isoformat() if job.found_at else None,
-        "notified_at": job.notified_at.isoformat() if job.notified_at else None,
-        "applied_at": job.applied_at.isoformat() if job.applied_at else None,
-        "status_updated_at": job.status_updated_at.isoformat() if job.status_updated_at else None,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "expires_at": job.expires_at.isoformat() if job.expires_at else None,
+        "responded_at": job.responded_at.isoformat() if job.responded_at else None,
+    }
+
+
+def _application_to_dict(app_record: Application) -> dict:
+    return {
+        "id": app_record.id,
+        "job_hash": app_record.job_hash,
+        "company": app_record.company,
+        "title": app_record.title,
+        "source": app_record.source,
+        "apply_url": app_record.apply_url,
+        # Application details
+        "applied_at": app_record.applied_at.isoformat() if app_record.applied_at else None,
+        "application_method": app_record.application_method,
+        "application_result": app_record.application_result,
+        "status": app_record.status,
+        # Evidence
+        "screenshot_path": app_record.screenshot_path,
+        "cover_letter_used": app_record.cover_letter_used,
+        "error_message": app_record.error_message,
     }
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Routes — Suggested Jobs
 # ---------------------------------------------------------------------------
 
 @app.route("/health")
@@ -88,136 +89,213 @@ def health():
     return jsonify({"status": "ok"})
 
 
-@app.route("/api/jobs")
-def list_jobs():
+@app.route("/api/suggested")
+def list_suggested():
     session = get_session()
     try:
-        query = session.query(Job)
+        query = session.query(SuggestedJob)
 
         status = request.args.get("status")
         level = request.args.get("level")
+        source = request.args.get("source")
         search = request.args.get("search", "").strip()
-        sort = request.args.get("sort", "found_at")
+        sort = request.args.get("sort", "created_at")
         order = request.args.get("order", "desc")
         page = max(1, int(request.args.get("page", 1)))
         per_page = min(100, max(1, int(request.args.get("per_page", 20))))
 
         if status:
-            query = query.filter(Job.status == status)
+            query = query.filter(SuggestedJob.status == status)
         if level:
-            query = query.filter(Job.level == level)
+            query = query.filter(SuggestedJob.level == level)
+        if source:
+            query = query.filter(SuggestedJob.source == source)
         if search:
             like = f"%{search}%"
             query = query.filter(
-                Job.title.ilike(like) | Job.company.ilike(like)
+                SuggestedJob.title.ilike(like) | SuggestedJob.company.ilike(like)
             )
 
         sort_col = {
-            "score": Job.score,
-            "status": Job.status,
-            "company": Job.company,
-            "applied_at": Job.applied_at,
-        }.get(sort, Job.found_at)
+            "score": SuggestedJob.score,
+            "company": SuggestedJob.company,
+            "status": SuggestedJob.status,
+            "expires_at": SuggestedJob.expires_at,
+        }.get(sort, SuggestedJob.created_at)
 
         query = query.order_by(sort_col.asc() if order == "asc" else sort_col.desc())
 
         total = query.count()
         jobs = query.offset((page - 1) * per_page).limit(per_page).all()
 
-        result = [_job_to_dict(j) for j in jobs]
-
-        # source filter is post-DB (source may be inferred)
-        source = request.args.get("source")
-        if source:
-            result = [j for j in result if j["source"] == source]
-
-        referral_type = request.args.get("referral_type")
-        if referral_type:
-            result = [j for j in result if j["referral_type"] == referral_type]
-
-        return jsonify({"jobs": result, "total": total, "page": page, "per_page": per_page})
+        return jsonify({
+            "jobs": [_suggested_to_dict(j) for j in jobs],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        })
     finally:
         session.close()
 
 
-@app.route("/api/jobs/<job_id>")
-def get_job(job_id):
+@app.route("/api/suggested/<job_hash>")
+def get_suggested(job_hash):
     session = get_session()
     try:
-        job = session.query(Job).filter(Job.job_id == job_id).first()
+        job = session.query(SuggestedJob).filter(SuggestedJob.job_hash == job_hash).first()
         if not job:
-            return jsonify({"error": "Job not found"}), 404
-        return jsonify(_job_to_dict(job))
+            return jsonify({"error": "Suggested job not found"}), 404
+        return jsonify(_suggested_to_dict(job))
     finally:
         session.close()
 
 
-@app.route("/api/jobs/<job_id>", methods=["PATCH"])
-def update_job(job_id):
+@app.route("/api/suggested/<job_hash>", methods=["PATCH"])
+def update_suggested(job_hash):
+    """Approve or reject a suggested job from the dashboard."""
     session = get_session()
     try:
-        job = session.query(Job).filter(Job.job_id == job_id).first()
+        job = session.query(SuggestedJob).filter(SuggestedJob.job_hash == job_hash).first()
         if not job:
-            return jsonify({"error": "Job not found"}), 404
+            return jsonify({"error": "Suggested job not found"}), 404
 
         data = request.get_json() or {}
-        allowed = ["status", "notes", "referral_type", "referral_url"]
+        allowed = ["status"]
         for field in allowed:
             if field in data:
                 setattr(job, field, data[field])
 
-        if "status" in data:
-            job.status_updated_at = datetime.now(timezone.utc)
-            if data["status"] == "applied" and not job.applied_at:
-                job.applied_at = datetime.now(timezone.utc)
+        if "status" in data and data["status"] in ("approved", "rejected"):
+            job.responded_at = datetime.now(timezone.utc)
 
         session.commit()
-        return jsonify(_job_to_dict(job))
+        return jsonify(_suggested_to_dict(job))
     finally:
         session.close()
 
+
+# ---------------------------------------------------------------------------
+# Routes — Applications
+# ---------------------------------------------------------------------------
+
+@app.route("/api/applications")
+def list_applications():
+    session = get_session()
+    try:
+        query = session.query(Application)
+
+        status = request.args.get("status")
+        source = request.args.get("source")
+        search = request.args.get("search", "").strip()
+        sort = request.args.get("sort", "applied_at")
+        order = request.args.get("order", "desc")
+        page = max(1, int(request.args.get("page", 1)))
+        per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+
+        if status:
+            query = query.filter(Application.status == status)
+        if source:
+            query = query.filter(Application.source == source)
+        if search:
+            like = f"%{search}%"
+            query = query.filter(
+                Application.title.ilike(like) | Application.company.ilike(like)
+            )
+
+        sort_col = {
+            "company": Application.company,
+            "status": Application.status,
+        }.get(sort, Application.applied_at)
+
+        query = query.order_by(sort_col.asc() if order == "asc" else sort_col.desc())
+
+        total = query.count()
+        apps = query.offset((page - 1) * per_page).limit(per_page).all()
+
+        return jsonify({
+            "applications": [_application_to_dict(a) for a in apps],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        })
+    finally:
+        session.close()
+
+
+@app.route("/api/applications/<job_hash>")
+def get_application(job_hash):
+    session = get_session()
+    try:
+        app_record = session.query(Application).filter(Application.job_hash == job_hash).first()
+        if not app_record:
+            return jsonify({"error": "Application not found"}), 404
+        return jsonify(_application_to_dict(app_record))
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Routes — Stats
+# ---------------------------------------------------------------------------
 
 @app.route("/api/stats")
 def get_stats():
     session = get_session()
     try:
-        total = session.query(Job).count()
-
-        by_status = dict(
-            session.query(Job.status, func.count(Job.id))
-            .group_by(Job.status)
-            .all()
+        # Suggested stats
+        suggested_total = session.query(SuggestedJob).count()
+        suggested_by_status = dict(
+            session.query(SuggestedJob.status, func.count(SuggestedJob.id))
+            .group_by(SuggestedJob.status).all()
+        )
+        suggested_by_level = dict(
+            session.query(SuggestedJob.level, func.count(SuggestedJob.id))
+            .filter(SuggestedJob.level.isnot(None))
+            .group_by(SuggestedJob.level).all()
+        )
+        suggested_by_source = dict(
+            session.query(SuggestedJob.source, func.count(SuggestedJob.id))
+            .filter(SuggestedJob.source.isnot(None))
+            .group_by(SuggestedJob.source).all()
         )
 
-        by_level = dict(
-            session.query(Job.level, func.count(Job.id))
-            .filter(Job.level.isnot(None))
-            .group_by(Job.level)
-            .all()
+        # Application stats
+        app_total = session.query(Application).count()
+        app_by_status = dict(
+            session.query(Application.status, func.count(Application.id))
+            .group_by(Application.status).all()
         )
 
-        # Source breakdown (infer from job_id when source column is null)
-        all_jobs = session.query(Job.job_id, Job.source).all()
-        by_source: dict[str, int] = {}
-        for job_id, source in all_jobs:
-            s = source or _infer_source(job_id)
-            by_source[s] = by_source.get(s, 0) + 1
-
-        applied_statuses = ["applied", "in_review", "rejected", "interview", "next_stage", "accepted"]
-        recent = (
-            session.query(Job)
-            .filter(Job.status.in_(applied_statuses))
-            .order_by(Job.applied_at.desc().nullslast(), Job.found_at.desc())
+        # Recent applications
+        recent_apps = (
+            session.query(Application)
+            .order_by(Application.applied_at.desc())
             .limit(10)
             .all()
         )
 
+        # Pending suggestions
+        pending_suggestions = (
+            session.query(SuggestedJob)
+            .filter(SuggestedJob.status == "suggested")
+            .order_by(SuggestedJob.created_at.desc())
+            .limit(5)
+            .all()
+        )
+
         return jsonify({
-            "total": total,
-            "by_status": by_status,
-            "by_level": by_level,
-            "by_source": by_source,
-            "recent": [_job_to_dict(j) for j in recent],
+            "suggested": {
+                "total": suggested_total,
+                "by_status": suggested_by_status,
+                "by_level": suggested_by_level,
+                "by_source": suggested_by_source,
+                "pending": [_suggested_to_dict(j) for j in pending_suggestions],
+            },
+            "applications": {
+                "total": app_total,
+                "by_status": app_by_status,
+                "recent": [_application_to_dict(a) for a in recent_apps],
+            },
         })
     finally:
         session.close()

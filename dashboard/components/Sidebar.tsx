@@ -2,11 +2,12 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, Briefcase, Settings } from "lucide-react";
+import { LayoutDashboard, Briefcase, Inbox, Send } from "lucide-react";
 
 const NAV = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
-  { href: "/applications", label: "Applications", icon: Briefcase },
+  { href: "/suggested", label: "Suggested Jobs", icon: Inbox },
+  { href: "/applications", label: "Applications", icon: Send },
 ];
 
 export default function Sidebar() {
@@ -48,8 +49,7 @@ export default function Sidebar() {
       {/* Footer */}
       <div className="px-3 pb-4">
         <div className="flex items-center gap-2 px-3 py-2 rounded-lg text-white/40 text-xs">
-          <Settings className="w-3.5 h-3.5" />
-          Phase 2 coming soon
+          Phase 2: Human-in-the-loop
         </div>
       </div>
     </aside>

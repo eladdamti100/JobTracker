@@ -1,10 +1,80 @@
+import hashlib
 from sqlalchemy import Column, String, Integer, Float, DateTime, Text, JSON
 from sqlalchemy.orm import declarative_base
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 Base = declarative_base()
 
 
+def make_job_hash(company: str, title: str, apply_url: str) -> str:
+    """md5(company.lower() + title.lower() + apply_url) — unique job identity."""
+    raw = f"{company.lower()}{title.lower()}{apply_url}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+class SuggestedJob(Base):
+    __tablename__ = "suggested_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_hash = Column(String, unique=True, nullable=False, index=True)
+    company = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    source = Column(String)               # HireMeTech / LinkedIn / WhatsApp
+    apply_url = Column(String)
+    location = Column(String)
+    description = Column(Text)
+    date_posted = Column(String)
+    salary = Column(String)
+
+    # Claude scoring
+    score = Column(Float)
+    reason = Column(Text)
+    level = Column(String)                 # student / junior / senior
+    role_type = Column(String)
+    tech_stack_match = Column(JSON)
+    is_student_position = Column(Integer)  # SQLite boolean
+    apply_strategy = Column(String)
+    role_summary = Column(Text)
+    requirements_summary = Column(Text)
+
+    # Lifecycle: suggested → approved → rejected → skipped → expired → applied
+    status = Column(String, default="suggested", index=True)
+
+    # Timestamps
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at = Column(DateTime, default=lambda: datetime.now(timezone.utc) + timedelta(hours=24))
+    responded_at = Column(DateTime)
+
+    def __repr__(self):
+        return f"<SuggestedJob {self.job_hash[:8]}: {self.company} - {self.title} [{self.status}]>"
+
+
+class Application(Base):
+    __tablename__ = "applications"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_hash = Column(String, nullable=False, index=True)
+    company = Column(String, nullable=False)
+    title = Column(String, nullable=False)
+    source = Column(String)
+    apply_url = Column(String)
+
+    # Application details
+    applied_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    application_method = Column(String)    # "auto_apply" / "manual" / "easy_apply"
+    application_result = Column(String)    # "success" / "failed" / "pending"
+    status = Column(String, default="pending", index=True)  # success / failed / pending
+
+    # Evidence
+    screenshot_path = Column(String)
+    cover_letter_used = Column(Text)
+    error_message = Column(Text)
+
+    def __repr__(self):
+        return f"<Application {self.job_hash[:8]}: {self.company} - {self.title} [{self.status}]>"
+
+
+# Keep legacy Job model so existing DB table isn't orphaned
 class Job(Base):
     __tablename__ = "jobs"
 
@@ -17,31 +87,24 @@ class Job(Base):
     apply_url = Column(String)
     date_posted = Column(String)
     salary = Column(String)
-
-    # Claude scoring
     score = Column(Float)
     reason = Column(Text)
-    level = Column(String)            # student / junior / senior
+    level = Column(String)
     role_type = Column(String)
     tech_stack_match = Column(JSON)
-    is_student_position = Column(Integer)  # SQLite boolean
+    is_student_position = Column(Integer)
     apply_strategy = Column(String)
-    role_summary = Column(Text)       # Hebrew summary from Claude
-    requirements_summary = Column(Text)  # Hebrew requirements from Claude
-
-    # Lifecycle
+    role_summary = Column(Text)
+    requirements_summary = Column(Text)
     status = Column(String, default="new", index=True)
-    # new → scored → notified → approved → applying → applied / failed
     cover_letter_used = Column(Text)
     error_message = Column(Text)
-
-    # Dashboard / application tracking
-    source = Column(String)               # HireMeTech / LinkedIn / WhatsApp
+    application_method = Column(String)
+    application_result = Column(String)
+    source = Column(String)
     notes = Column(Text)
-    referral_type = Column(String)        # "referral" or "regular"
+    referral_type = Column(String)
     referral_url = Column(String)
-
-    # Timestamps
     found_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     notified_at = Column(DateTime)
     applied_at = Column(DateTime)

@@ -1,9 +1,9 @@
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft, ExternalLink, MapPin, Building2, Calendar, Star, Zap } from "lucide-react";
-import { fetchJob } from "@/lib/api";
+import { fetchSuggestedJob } from "@/lib/api";
 import StatusBadge from "@/components/StatusBadge";
-import ApplicationActions from "./ApplicationActions";
+import SuggestedActions from "./SuggestedActions";
 
 function formatDate(iso: string | null): string {
   if (!iso) return "—";
@@ -20,15 +20,15 @@ function formatDateTime(iso: string | null): string {
 }
 
 interface Props {
-  params: Promise<{ id: string }>;
+  params: Promise<{ hash: string }>;
 }
 
-export default async function ApplicationDetailPage({ params }: Props) {
-  const { id } = await params;
+export default async function SuggestedDetailPage({ params }: Props) {
+  const { hash } = await params;
 
   let job;
   try {
-    job = await fetchJob(id);
+    job = await fetchSuggestedJob(hash);
   } catch {
     notFound();
   }
@@ -39,13 +39,12 @@ export default async function ApplicationDetailPage({ params }: Props) {
 
   return (
     <div className="p-8 max-w-5xl mx-auto">
-      {/* Back */}
       <Link
-        href="/applications"
+        href="/suggested"
         className="inline-flex items-center gap-1.5 text-sm text-gray-400 hover:text-gray-700 mb-6 transition-colors"
       >
         <ArrowLeft className="w-4 h-4" />
-        Back to Applications
+        Back to Suggested Jobs
       </Link>
 
       {/* Header */}
@@ -53,8 +52,8 @@ export default async function ApplicationDetailPage({ params }: Props) {
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="flex items-center gap-2 mb-1">
-              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">
-                {job.job_id}
+              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 font-mono">
+                {job.job_hash.slice(0, 8)}
               </span>
               <span className="text-xs text-gray-400">{job.source}</span>
             </div>
@@ -94,7 +93,7 @@ export default async function ApplicationDetailPage({ params }: Props) {
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1.5 text-sm text-indigo-600 hover:text-indigo-800 font-medium"
             >
-              Apply Now <ExternalLink className="w-3.5 h-3.5" />
+              View Job <ExternalLink className="w-3.5 h-3.5" />
             </a>
             <span className="ml-2 text-xs text-gray-400 font-mono truncate max-w-xs inline-block align-bottom">
               {job.apply_url}
@@ -157,7 +156,7 @@ export default async function ApplicationDetailPage({ params }: Props) {
           )}
         </div>
 
-        {/* Right: Application tracking */}
+        {/* Right: Metadata + Actions */}
         <div className="space-y-6">
           {/* Metadata */}
           <div className="bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
@@ -193,26 +192,22 @@ export default async function ApplicationDetailPage({ params }: Props) {
             <h2 className="text-sm font-semibold text-gray-700 mb-4">Timeline</h2>
             <dl className="space-y-2.5 text-sm">
               <div>
-                <dt className="text-gray-400 text-xs">Found</dt>
-                <dd className="text-gray-700">{formatDate(job.found_at)}</dd>
+                <dt className="text-gray-400 text-xs">Suggested</dt>
+                <dd className="text-gray-700">{formatDateTime(job.created_at)}</dd>
               </div>
               <div>
-                <dt className="text-gray-400 text-xs">Notified</dt>
-                <dd className="text-gray-700">{formatDateTime(job.notified_at)}</dd>
+                <dt className="text-gray-400 text-xs">Expires</dt>
+                <dd className="text-gray-700">{formatDateTime(job.expires_at)}</dd>
               </div>
               <div>
-                <dt className="text-gray-400 text-xs">Applied</dt>
-                <dd className="text-gray-700">{formatDate(job.applied_at)}</dd>
-              </div>
-              <div>
-                <dt className="text-gray-400 text-xs">Status updated</dt>
-                <dd className="text-gray-700">{formatDateTime(job.status_updated_at)}</dd>
+                <dt className="text-gray-400 text-xs">Responded</dt>
+                <dd className="text-gray-700">{formatDateTime(job.responded_at)}</dd>
               </div>
             </dl>
           </div>
 
-          {/* Interactive: status + notes + referral */}
-          <ApplicationActions job={job} />
+          {/* Actions */}
+          <SuggestedActions job={job} />
         </div>
       </div>
     </div>

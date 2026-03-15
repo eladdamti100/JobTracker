@@ -1,4 +1,10 @@
-import type { Job, JobsResponse, Stats } from "@/types";
+import type {
+  SuggestedJob,
+  SuggestedJobsResponse,
+  Application,
+  ApplicationsResponse,
+  Stats,
+} from "@/types";
 
 const API_URL =
   process.env.NEXT_PUBLIC_API_URL ??
@@ -12,45 +18,72 @@ function buildQuery(params: Record<string, string | number | undefined>): string
   return q.toString();
 }
 
-export async function fetchJobs(params: {
+// --- Suggested Jobs ---
+
+export async function fetchSuggested(params: {
   page?: number;
   per_page?: number;
   status?: string;
   source?: string;
   level?: string;
-  referral_type?: string;
   search?: string;
   sort?: string;
   order?: string;
-}): Promise<JobsResponse> {
-  const res = await fetch(`${API_URL}/api/jobs?${buildQuery(params)}`, {
+}): Promise<SuggestedJobsResponse> {
+  const res = await fetch(`${API_URL}/api/suggested?${buildQuery(params)}`, {
     cache: "no-store",
   });
-  if (!res.ok) throw new Error(`Failed to fetch jobs: ${res.status}`);
+  if (!res.ok) throw new Error(`Failed to fetch suggested jobs: ${res.status}`);
   return res.json();
 }
 
-export async function fetchJob(jobId: string): Promise<Job> {
-  const res = await fetch(`${API_URL}/api/jobs/${jobId}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Job not found: ${res.status}`);
+export async function fetchSuggestedJob(jobHash: string): Promise<SuggestedJob> {
+  const res = await fetch(`${API_URL}/api/suggested/${jobHash}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Suggested job not found: ${res.status}`);
   return res.json();
 }
 
-export async function fetchStats(): Promise<Stats> {
-  const res = await fetch(`${API_URL}/api/stats`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`Failed to fetch stats: ${res.status}`);
-  return res.json();
-}
-
-export async function updateJob(
-  jobId: string,
-  data: Partial<Pick<Job, "status" | "notes" | "referral_type" | "referral_url">>
-): Promise<Job> {
-  const res = await fetch(`${API_URL}/api/jobs/${jobId}`, {
+export async function updateSuggested(
+  jobHash: string,
+  data: { status: string }
+): Promise<SuggestedJob> {
+  const res = await fetch(`${API_URL}/api/suggested/${jobHash}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error(`Failed to update job: ${res.status}`);
+  if (!res.ok) throw new Error(`Failed to update suggested job: ${res.status}`);
+  return res.json();
+}
+
+// --- Applications ---
+
+export async function fetchApplications(params: {
+  page?: number;
+  per_page?: number;
+  status?: string;
+  source?: string;
+  search?: string;
+  sort?: string;
+  order?: string;
+}): Promise<ApplicationsResponse> {
+  const res = await fetch(`${API_URL}/api/applications?${buildQuery(params)}`, {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`Failed to fetch applications: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchApplication(jobHash: string): Promise<Application> {
+  const res = await fetch(`${API_URL}/api/applications/${jobHash}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Application not found: ${res.status}`);
+  return res.json();
+}
+
+// --- Stats ---
+
+export async function fetchStats(): Promise<Stats> {
+  const res = await fetch(`${API_URL}/api/stats`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`Failed to fetch stats: ${res.status}`);
   return res.json();
 }

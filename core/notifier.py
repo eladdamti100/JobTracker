@@ -1,4 +1,4 @@
-"""WhatsApp notifications via Twilio — one message per job card."""
+"""WhatsApp notifications via Twilio — job suggestion cards with YES/NO/SKIP."""
 
 import os
 import time
@@ -26,46 +26,51 @@ def send_whatsapp(message: str) -> bool:
         return False
 
 
-def format_job_card(job: dict) -> str:
-    """Format a single job as a clean WhatsApp card message."""
+def format_suggestion_card(job: dict) -> str:
+    """Format a job as a WhatsApp suggestion card with YES/NO/SKIP options."""
     level_map = {"student": "סטודנט", "junior": "ג׳וניור", "senior": "סניור"}
     level_display = level_map.get(job.get("level", ""), job.get("job_level", "לא ידוע"))
 
-    role_summary = job.get("role_summary") or "לא צוין"
-    req_summary = job.get("requirements_summary") or "לא צוין"
-    posted = job.get("posted_at") or job.get("date_posted") or "לא ידוע"
+    reason = job.get("reason") or job.get("role_summary") or ""
     apply_url = job.get("apply_url", "")
-    job_id = job.get("job_id", "")
 
     return (
-        f'🏢 *{job["company"]}* — {job["title"]}\n\n'
-        f'📋 *תפקיד:* {role_summary}\n\n'
-        f'🎯 *דרישות:* {req_summary}\n\n'
-        f'👤 *רמה:* {level_display}\n'
-        f'📅 *פורסם:* {posted}\n'
+        f'🆕 *New Job Match!*\n\n'
+        f'🏢 *{job["company"]}* — {job["title"]}\n'
+        f'👤 Level: {level_display}\n'
+        f'🎯 Score: {job.get("score", "?")}/10\n'
+        f'💬 {reason}\n'
         f'🔗 {apply_url}\n\n'
-        f'APPLY {job_id}'
+        f'Reply:\n'
+        f'✅ *YES* — to apply automatically\n'
+        f'❌ *NO* — to skip forever\n'
+        f'⏰ *SKIP* — remind me in 12 hours'
     )
 
 
-def send_job_cards(jobs: list[dict], delay_sec: float = 1.0) -> tuple[int, int]:
-    """Send each job as a separate WhatsApp message card.
+def send_suggestion(job: dict, delay_sec: float = 0.5) -> bool:
+    """Send a single job suggestion card via WhatsApp. Returns True on success."""
+    card = format_suggestion_card(job)
+    return send_whatsapp(card)
+
+
+def send_suggestions(jobs: list[dict], delay_sec: float = 1.0) -> tuple[int, int]:
+    """Send multiple job suggestion cards via WhatsApp.
 
     Returns (sent_count, failed_count).
     """
     sent, failed = 0, 0
-    logger.info(f"Sending {len(jobs)} job cards via WhatsApp...")
+    logger.info(f"Sending {len(jobs)} job suggestions via WhatsApp...")
 
-    # Header message
-    send_whatsapp(
-        f"🤖 *JobTracker* — נמצאו {len(jobs)} משרות מתאימות!\n"
-        f"כל משרה תגיע בהודעה נפרדת 👇"
-    )
-    time.sleep(delay_sec)
+    if len(jobs) > 1:
+        send_whatsapp(
+            f"🤖 *JobTracker* — נמצאו {len(jobs)} משרות מתאימות!\n"
+            f"כל משרה תגיע בהודעה נפרדת 👇"
+        )
+        time.sleep(delay_sec)
 
     for job in jobs:
-        card = format_job_card(job)
-        ok = send_whatsapp(card)
+        ok = send_suggestion(job)
         if ok:
             sent += 1
         else:
@@ -73,18 +78,23 @@ def send_job_cards(jobs: list[dict], delay_sec: float = 1.0) -> tuple[int, int]:
         if delay_sec > 0:
             time.sleep(delay_sec)
 
-    logger.info(f"Job cards: {sent} sent, {failed} failed")
+    logger.info(f"Suggestions: {sent} sent, {failed} failed")
     return sent, failed
 
 
-# Keep for backwards compatibility with test_phase1.py
+# Legacy aliases for backwards compatibility
+def format_job_card(job: dict) -> str:
+    return format_suggestion_card(job)
+
+def send_job_cards(jobs: list[dict], delay_sec: float = 1.0) -> tuple[int, int]:
+    return send_suggestions(jobs, delay_sec)
+
 def send_whatsapp_jobs(jobs: list[dict]) -> bool:
-    sent, failed = send_job_cards(jobs)
+    sent, failed = send_suggestions(jobs)
     return failed == 0
 
-
 def format_job_message(jobs: list[dict]) -> str:
-    """Legacy single-message format — kept for test_phase1.py."""
+    """Legacy single-message format."""
     header = f"🤖 *JobTracker* — נמצאו {len(jobs)} משרות מתאימות:\n"
     lines = [header]
     for job in jobs:
@@ -94,6 +104,5 @@ def format_job_message(jobs: list[dict]) -> str:
             f'📍 {job.get("location", "N/A")} | 💰 {salary}\n'
             f'🎯 ציון: {job["score"]}/10 | 💬 {job.get("reason", "")}\n'
             f'🔗 {job["apply_url"]}\n'
-            f'APPLY {job["job_id"]}'
         )
     return "\n\n".join(lines)
