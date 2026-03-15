@@ -2,11 +2,15 @@
 Inbound WhatsApp webhook via Flask + Twilio.
 
 Human-in-the-loop flow:
-  YES    → approve last suggested job, trigger auto-apply
+  YES    → approve last suggested job, ask for feedback/instructions
+           (2nd reply) "כן"/"go"/"submit" → apply immediately
+           (2nd reply) free text          → apply with instruction injected into cover letter
+           (2nd reply) "המתן"/"wait"      → hold, don't apply yet
   NO     → reject last suggested job permanently
   SKIP   → snooze for 12 hours
   STATUS → show stats summary
   SCAN   → trigger immediate scan
+  WAIT   → pause a pending application (while in awaiting_feedback state)
 
 Run standalone:  python webhook.py
 Or via main.py:  python main.py webhook
@@ -57,19 +61,145 @@ def _get_last_suggested():
         session.close()
 
 
-def _handle_yes() -> str:
-    """Approve the last suggested job and trigger auto-apply."""
+def _get_conversation_state():
+    """Return the single ConversationState row."""
     from db.database import get_session
-    from db.models import SuggestedJob, Application
+    from db.models import ConversationState
+    session = get_session()
+    try:
+        state = session.query(ConversationState).first()
+        if state:
+            from sqlalchemy.orm import make_transient
+            session.expunge(state)
+        return state
+    finally:
+        session.close()
+
+
+def _set_conversation_state(state: str, job_hash: str = None,
+                             field_label: str = None, field_answer: str = None):
+    """Update the single ConversationState row."""
+    from db.database import get_session
+    from db.models import ConversationState
+    session = get_session()
+    try:
+        row = session.query(ConversationState).first()
+        if not row:
+            row = ConversationState()
+            session.add(row)
+        row.state = state
+        row.pending_job_hash = job_hash
+        row.pending_field_label = field_label
+        row.field_answer = field_answer
+        row.updated_at = datetime.now(timezone.utc)
+        session.commit()
+    finally:
+        session.close()
+
+
+def _spawn_apply_thread(job_hash: str, company: str, title: str,
+                        apply_url: str, description: str, user_instruction: str = ""):
+    """Spawn a background thread to run auto-apply and notify via WhatsApp."""
+    def run_apply():
+        from db.database import get_session as gs
+        from db.models import SuggestedJob as SJ, Application as App
+        from core.applicator import apply_to_job
+        from core.notifier import send_whatsapp
+
+        result = apply_to_job(
+            job_id=job_hash[:8],
+            apply_url=apply_url,
+            job_title=title,
+            company=company,
+            job_description=description,
+            auto_submit=True,
+            user_instruction=user_instruction,
+        )
+
+        s = gs()
+        try:
+            sj = s.query(SJ).filter_by(job_hash=job_hash).first()
+            if sj:
+                sj.status = "applied"
+
+            now = datetime.now(timezone.utc)
+            app_record = App(
+                job_hash=job_hash,
+                company=company,
+                title=title,
+                apply_url=apply_url,
+                applied_at=now,
+                application_method=result.get("application_result", "auto_apply")
+                    if result.get("application_result") == "easy_apply" else "auto_apply",
+            )
+
+            if result["success"]:
+                app_record.status = "success"
+                app_record.application_result = result.get("application_result", "success")
+                app_record.cover_letter_used = result.get("cover_letter")
+                screenshots = result.get("screenshots", [])
+                app_record.screenshot_path = screenshots[0] if screenshots else None
+                send_whatsapp(f"✅ הוגש בהצלחה! {company} — {title}")
+            else:
+                app_record.status = "failed"
+                app_record.application_result = "failed"
+                app_record.error_message = result.get("error", "Unknown error")
+                send_whatsapp(f"❌ ההגשה נכשלה: {company} — {title}\n{result.get('error', '')}")
+
+            s.add(app_record)
+            s.commit()
+        except Exception as e:
+            logger.error(f"Apply thread error: {e}")
+            s.rollback()
+        finally:
+            s.close()
+        # Reset conversation state after apply completes
+        _set_conversation_state("idle")
+
+    thread = threading.Thread(target=run_apply, daemon=True)
+    thread.start()
+
+
+def _handle_field_answer(text: str) -> str:
+    """Store the user's answer to an unknown form field and signal the applicator to resume."""
+    conv = _get_conversation_state()
+    if not conv or conv.state != "pending_field":
+        return "❌ לא ציפיתי לתשובה כרגע."
+
+    field_label = conv.pending_field_label or "שדה לא ידוע"
+    _set_conversation_state(
+        state="field_answer_ready",
+        job_hash=conv.pending_job_hash,
+        field_label=field_label,
+        field_answer=text.strip(),
+    )
+    return (
+        f"✅ קיבלתי! ממשיך למלא את הטופס...\n"
+        f"_(שדה: \"{field_label}\")_"
+    )
+
+
+def _handle_yes(job_hash_prefix: str = None) -> str:
+    """Approve a job and immediately start applying."""
+    from db.database import get_session
+    from db.models import SuggestedJob
 
     session = get_session()
     try:
-        job = (
-            session.query(SuggestedJob)
-            .filter(SuggestedJob.status == "suggested")
-            .order_by(SuggestedJob.created_at.desc())
-            .first()
-        )
+        if job_hash_prefix:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.job_hash.like(f"{job_hash_prefix}%"))
+                .filter(SuggestedJob.status == "suggested")
+                .first()
+            )
+        else:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.status == "suggested")
+                .order_by(SuggestedJob.created_at.desc())
+                .first()
+            )
         if not job:
             return "❌ אין משרות ממתינות לאישור."
 
@@ -77,88 +207,93 @@ def _handle_yes() -> str:
         job.responded_at = datetime.now(timezone.utc)
         session.commit()
 
+        # Immediately start applying
+        job_hash = job.job_hash
         company = job.company
         title = job.title
-        job_hash = job.job_hash
         apply_url = job.apply_url
         description = job.description or ""
-
-        # Trigger auto-apply in background thread
-        def run_apply():
-            from db.database import get_session as gs
-            from db.models import SuggestedJob as SJ, Application as App
-            from core.applicator import apply_to_job
-            from core.notifier import send_whatsapp
-
-            result = apply_to_job(
-                job_id=job_hash[:8],
-                apply_url=apply_url,
-                job_title=title,
-                company=company,
-                job_description=description,
-                auto_submit=True,
-            )
-
-            s = gs()
-            try:
-                # Update suggested job status
-                sj = s.query(SJ).filter_by(job_hash=job_hash).first()
-                if sj:
-                    sj.status = "applied"
-
-                now = datetime.now(timezone.utc)
-                app_record = App(
-                    job_hash=job_hash,
-                    company=company,
-                    title=title,
-                    apply_url=apply_url,
-                    applied_at=now,
-                    application_method="auto_apply",
-                )
-
-                if result["success"]:
-                    app_record.status = "success"
-                    app_record.application_result = result.get("application_result", "success")
-                    app_record.cover_letter_used = result.get("cover_letter")
-                    screenshots = result.get("screenshots", [])
-                    app_record.screenshot_path = screenshots[0] if screenshots else None
-                    send_whatsapp(f"✅ הוגש בהצלחה! {company} — {title}")
-                else:
-                    app_record.status = "failed"
-                    app_record.application_result = "failed"
-                    app_record.error_message = result.get("error", "Unknown error")
-                    send_whatsapp(f"❌ ההגשה נכשלה: {company} — {title}\n{result.get('error', '')}")
-
-                s.add(app_record)
-                s.commit()
-            except Exception as e:
-                logger.error(f"Apply thread error: {e}")
-                s.rollback()
-            finally:
-                s.close()
-
-        thread = threading.Thread(target=run_apply, daemon=True)
-        thread.start()
-
-        return f"✅ מגיש ל-{company} עכשיו...\nאעדכן כשזה יסתיים."
-
     finally:
         session.close()
 
+    _set_conversation_state("idle")
+    _spawn_apply_thread(job_hash, company, title, apply_url, description)
 
-def _handle_no() -> str:
-    """Reject the last suggested job permanently."""
+    return f"⚙️ מגיש עכשיו ל-*{company}* — {title}...\nאעדכן כשזה יסתיים."
+
+
+def _handle_feedback(text: str) -> str:
+    """Stage 2: Process the user's reply after YES — apply with optional instruction."""
     from db.database import get_session
     from db.models import SuggestedJob
 
+    conv = _get_conversation_state()
+    if not conv or not conv.pending_job_hash:
+        _set_conversation_state("idle")
+        return "❌ לא מצאתי משרה ממתינה. שלח YES כדי להתחיל."
+
+    job_hash = conv.pending_job_hash
+    upper = text.upper().strip()
+
+    # User wants to hold — don't apply yet
+    if upper in ("המתן", "WAIT", "HOLD", "עצור", "STOP"):
+        _set_conversation_state("idle")
+        return "⏸ בסדר, לא מגיש עכשיו. שלח *YES* שוב כשתהיה מוכן."
+
+    # Fetch job details
     session = get_session()
     try:
-        job = (
-            session.query(SuggestedJob)
-            .filter(SuggestedJob.status == "suggested")
-            .order_by(SuggestedJob.created_at.desc())
-            .first()
-        )
+        job = session.query(SuggestedJob).filter_by(job_hash=job_hash).first()
+        if not job:
+            _set_conversation_state("idle")
+            return "❌ לא מצאתי את המשרה בבסיס הנתונים."
+
+        company = job.company
+        title = job.title
+        apply_url = job.apply_url
+        description = job.description or ""
+    finally:
+        session.close()
+
+    # Determine instruction (empty = "כן"/"yes"/"go" = apply as-is)
+    confirm_words = {"כן", "YES", "Y", "GO", "SUBMIT", "OK", "אוקי", "בסדר"}
+    instruction = "" if upper in confirm_words else text.strip()
+
+    # Confirm to user what we're about to do
+    if instruction:
+        confirm_msg = f"⚙️ מגיש ל-*{company}* עם הנחיה:\n_{instruction}_\n\nאעדכן כשזה יסתיים."
+    else:
+        confirm_msg = f"⚙️ מגיש ל-*{company}* — {title}...\nאעדכן כשזה יסתיים."
+
+    _set_conversation_state("idle")
+    _spawn_apply_thread(job_hash, company, title, apply_url, description, instruction)
+
+    return confirm_msg
+
+
+def _handle_no(job_hash_prefix: str = None) -> str:
+    """Reject a specific (or last) suggested job permanently."""
+    from db.database import get_session
+    from db.models import SuggestedJob
+
+    _set_conversation_state("idle")
+
+    session = get_session()
+    try:
+        if job_hash_prefix:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.job_hash.like(f"{job_hash_prefix}%"))
+                .filter(SuggestedJob.status.in_(["suggested", "approved"]))
+                .first()
+            )
+        else:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.status.in_(["suggested", "approved"]))
+                .order_by(SuggestedJob.created_at.desc())
+                .first()
+            )
         if not job:
             return "❌ אין משרות ממתינות."
 
@@ -171,19 +306,29 @@ def _handle_no() -> str:
         session.close()
 
 
-def _handle_skip() -> str:
-    """Snooze the last suggested job — re-suggest in 12 hours."""
+def _handle_skip(job_hash_prefix: str = None) -> str:
+    """Snooze a specific (or last) suggested job — re-suggest in 12 hours."""
     from db.database import get_session
     from db.models import SuggestedJob
 
+    _set_conversation_state("idle")
+
     session = get_session()
     try:
-        job = (
-            session.query(SuggestedJob)
-            .filter(SuggestedJob.status == "suggested")
-            .order_by(SuggestedJob.created_at.desc())
-            .first()
-        )
+        if job_hash_prefix:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.job_hash.like(f"{job_hash_prefix}%"))
+                .filter(SuggestedJob.status.in_(["suggested", "approved"]))
+                .first()
+            )
+        else:
+            job = (
+                session.query(SuggestedJob)
+                .filter(SuggestedJob.status.in_(["suggested", "approved"]))
+                .order_by(SuggestedJob.created_at.desc())
+                .first()
+            )
         if not job:
             return "❌ אין משרות ממתינות."
 
@@ -293,7 +438,7 @@ def _handle_scan() -> str:
             session.add(suggested)
             new_count += 1
 
-            send_suggestion({**job_data, **result})
+            send_suggestion({**job_data, **result, "job_hash": job_hash})
 
         session.commit()
         session.close()
@@ -312,14 +457,42 @@ def _handle_scan() -> str:
 def webhook():
     incoming = (request.form.get("Body") or "").strip()
     sender = request.form.get("From") or ""
-    logger.info(f"Incoming WhatsApp from {sender}: {incoming!r}")
+    button_payload = (request.form.get("ButtonPayload") or "").strip()
+    logger.info(f"Incoming WhatsApp from {sender}: {incoming!r} payload={button_payload!r}")
 
     resp = MessagingResponse()
-    upper = incoming.upper().strip()
+    # Strip emojis and extra whitespace for command matching (button replies include emojis)
+    import re
+    cleaned = re.sub(r'[^\w\s\u0590-\u05FF]', '', incoming).strip()
+    upper = cleaned.upper()
 
-    if upper in ("YES", "כן", "Y"):
-        reply = _handle_yes()
+    # --- Parse button payload for job-specific actions ---
+    # ButtonPayload format: "yes_929c7b17", "no_33708af4", "skip_929c7b17"
+    button_action = None
+    button_job_hash = None
+    if button_payload and "_" in button_payload:
+        parts = button_payload.split("_", 1)
+        button_action = parts[0].upper()  # YES, NO, SKIP
+        button_job_hash = parts[1]         # 8-char hash prefix
 
+    # --- Check conversation state first ---
+    # If we're waiting for the user's feedback/instruction after YES,
+    # route everything (except global commands) into the feedback handler.
+    conv = _get_conversation_state()
+    in_feedback = conv and conv.state == "awaiting_feedback"
+    in_pending_field = conv and conv.state == "pending_field"
+
+    # --- Button clicks with specific job hash take priority ---
+    if button_action == "NO" and button_job_hash:
+        reply = _handle_no(job_hash_prefix=button_job_hash)
+
+    elif button_action == "SKIP" and button_job_hash:
+        reply = _handle_skip(job_hash_prefix=button_job_hash)
+
+    elif button_action == "YES" and button_job_hash:
+        reply = _handle_yes(job_hash_prefix=button_job_hash)
+
+    # Global commands always work regardless of state
     elif upper in ("NO", "לא", "N"):
         reply = _handle_no()
 
@@ -336,11 +509,25 @@ def webhook():
         reply = (
             "🤖 *JobTracker — פקודות:*\n\n"
             "✅ *YES* — אשר והגש למשרה האחרונה\n"
-            "❌ *NO* — דלג על המשרה האחרונה\n"
+            "❌ *NO* — בטל / דחה\n"
             "⏰ *SKIP* — הזכר לי בעוד 12 שעות\n"
             "📊 *STATUS* — הצג סטטיסטיקות\n"
-            "🔍 *SCAN* — סרוק משרות חדשות עכשיו"
+            "🔍 *SCAN* — סרוק משרות חדשות עכשיו\n\n"
+            "_לאחר YES: כתוב הנחיה, 'כן' להגשה ישירה, או 'המתן' לעצירה._\n"
+            "_אם המערכת שואלת שאלה מהטופס — כתוב תשובה ישירות._"
         )
+
+    elif in_pending_field:
+        # Applicator is paused waiting for the user to answer an unknown form field
+        reply = _handle_field_answer(incoming)
+
+    elif in_feedback:
+        # Any other message after YES → treat as feedback/instruction
+        reply = _handle_feedback(incoming)
+
+    elif upper in ("YES", "כן", "Y"):
+        reply = _handle_yes()
+
     else:
         reply = (
             "לא הבנתי 🤔\n"

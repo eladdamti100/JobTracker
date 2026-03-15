@@ -3,7 +3,7 @@
 ## What is this project?
 
 JobTracker is an autonomous job-hunting agent for software engineering students in Israel.
-It scans job sources, scores them with Claude AI, sends suggestions via WhatsApp,
+It scans job sources, scores them with Groq, sends suggestions via WhatsApp,
 waits for user approval, and auto-applies using Playwright — all tracked on a dashboard.
 
 ## End-to-End Pipeline
@@ -12,7 +12,7 @@ waits for user approval, and auto-applies using Playwright — all tracked on a 
  SCAN               SCORE              SUGGEST             DECIDE              APPLY
  ─────              ─────              ───────             ──────              ─────
  HireMeTech ─┐                      Save to DB         User replies        Playwright
- LinkedIn   ─┼─→ Claude AI ─→ ─→  WhatsApp card  ─→  via WhatsApp  ─→  fills forms
+ LinkedIn   ─┼─→ Groq  ─→ ─→  WhatsApp card  ─→  via WhatsApp  ─→  fills forms
  WA Groups  ─┘   (1-10 score)     (YES/NO/SKIP)      YES → apply       → screenshot
                                                       NO  → reject      → save result
                                                       SKIP → snooze     → update DB
@@ -35,8 +35,8 @@ waits for user approval, and auto-applies using Playwright — all tracked on a 
 | `main.py` | CLI: scan, apply, webhook, api, schedule, expire |
 | `api.py` | Flask REST API for dashboard (port 5001) |
 | `webhook.py` | Twilio WhatsApp inbound handler (port 5000) |
-| `core/analyzer.py` | Claude AI job scoring & summarization |
-| `core/applicator.py` | Playwright form-filling engine (Claude Vision for field detection) |
+| `core/analyzer.py` | Groq job scoring & summarization |
+| `core/applicator.py` | Playwright form-filling engine (Groq Vision for field detection) |
 | `core/notifier.py` | Twilio WhatsApp outbound messaging |
 | `core/expiry.py` | Hourly job to expire stale suggestions |
 | `scanners/hiremetech.py` | HireMeTech public API scraper |
@@ -56,7 +56,7 @@ waits for user approval, and auto-applies using Playwright — all tracked on a 
 ### Data files (gitignored — contain personal info)
 | File | Purpose |
 |------|---------|
-| `config/profile.yaml` | Candidate profile for Claude scoring |
+| `config/profile.yaml` | Candidate profile for Groq scoring |
 | `data/default_answers.yaml` | Answer database for form auto-fill |
 | `data/CV Resume.pdf` | CV for upload fields |
 | `data/linkedin_session.json` | Persistent LinkedIn session cookies |
@@ -66,13 +66,13 @@ waits for user approval, and auto-applies using Playwright — all tracked on a 
 
 - **Job hash**: `MD5(company + title + apply_url)` — used for deduplication across all sources
 - **Scoring thresholds**: student-level jobs ≥ 6, junior-level ≥ 7
-- **Form filling**: 4-strategy cascade — direct mapping → fuzzy normalization → Claude suggestion → profile defaults
-- **Claude Vision**: screenshots of application forms are sent to Claude to identify and classify fields
+- **Form filling**: 4-strategy cascade — direct mapping → fuzzy normalization → Groq suggestion → profile defaults
+- **Groq Vision**: screenshots of application forms are sent to Groq to identify and classify fields
 - **Background apply**: webhook and dashboard trigger auto-apply in background threads to avoid blocking
 
 ## External services
 
-- **Claude API** (Anthropic) — job scoring + form field detection via Vision
+- **Groq API** — job scoring + form field detection via Vision
 - **Twilio** — WhatsApp messaging (inbound webhook + outbound notifications)
 - **LinkedIn** — Playwright scraping with saved session cookies
 - **HireMeTech** — public REST API
@@ -102,15 +102,15 @@ cd dashboard && npm run dev
 ## Environment variables
 
 Defined in `.env` (gitignored). See `.env.example` for template.
-Required: `ANTHROPIC_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`,
-`TWILIO_WHATSAPP_FROM`, `MY_WHATSAPP_NUMBER`, `LINKEDIN_EMAIL`, `LINKEDIN_PASSWORD`.
+Required: `GROQ_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`,
+`TWILIO_WHATSAPP_FROM`, `MY_WHATSAPP_NUMBER`.
 
 ## Tech stack
 
-- **Python**: Flask, Playwright, SQLAlchemy, Anthropic SDK, Twilio, APScheduler, Loguru
+- **Python**: Flask, Playwright, SQLAlchemy, OpenAI SDK (Groq), Twilio, APScheduler, Loguru
 - **Frontend**: Next.js 15, React 19, TypeScript, Tailwind CSS
 - **Database**: SQLite
-- **AI**: Claude (claude-sonnet-4-20250514) for scoring and Vision-based form analysis
+- **AI**: Groq — llama-3.3-70b-versatile for scoring/text, llama-3.2-90b-vision-preview for Vision-based form analysis
 
 ## Conventions
 

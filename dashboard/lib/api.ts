@@ -10,6 +10,14 @@ const API_URL =
   process.env.NEXT_PUBLIC_API_URL ??
   (typeof window !== "undefined" ? window.location.origin : "http://localhost:5001");
 
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? "";
+
+function authHeaders(): Record<string, string> {
+  const h: Record<string, string> = {};
+  if (API_KEY) h["X-API-Key"] = API_KEY;
+  return h;
+}
+
 function buildQuery(params: Record<string, string | number | undefined>): string {
   const q = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -32,13 +40,14 @@ export async function fetchSuggested(params: {
 }): Promise<SuggestedJobsResponse> {
   const res = await fetch(`${API_URL}/api/suggested?${buildQuery(params)}`, {
     cache: "no-store",
+    headers: authHeaders(),
   });
   if (!res.ok) throw new Error(`Failed to fetch suggested jobs: ${res.status}`);
   return res.json();
 }
 
 export async function fetchSuggestedJob(jobHash: string): Promise<SuggestedJob> {
-  const res = await fetch(`${API_URL}/api/suggested/${jobHash}`, { cache: "no-store" });
+  const res = await fetch(`${API_URL}/api/suggested/${jobHash}`, { cache: "no-store", headers: authHeaders() });
   if (!res.ok) throw new Error(`Suggested job not found: ${res.status}`);
   return res.json();
 }
@@ -49,7 +58,7 @@ export async function updateSuggested(
 ): Promise<SuggestedJob> {
   const res = await fetch(`${API_URL}/api/suggested/${jobHash}`, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(data),
   });
   if (!res.ok) throw new Error(`Failed to update suggested job: ${res.status}`);
@@ -69,13 +78,14 @@ export async function fetchApplications(params: {
 }): Promise<ApplicationsResponse> {
   const res = await fetch(`${API_URL}/api/applications?${buildQuery(params)}`, {
     cache: "no-store",
+    headers: authHeaders(),
   });
   if (!res.ok) throw new Error(`Failed to fetch applications: ${res.status}`);
   return res.json();
 }
 
 export async function fetchApplication(jobHash: string): Promise<Application> {
-  const res = await fetch(`${API_URL}/api/applications/${jobHash}`, { cache: "no-store" });
+  const res = await fetch(`${API_URL}/api/applications/${jobHash}`, { cache: "no-store", headers: authHeaders() });
   if (!res.ok) throw new Error(`Application not found: ${res.status}`);
   return res.json();
 }
@@ -83,7 +93,7 @@ export async function fetchApplication(jobHash: string): Promise<Application> {
 // --- Stats ---
 
 export async function fetchStats(): Promise<Stats> {
-  const res = await fetch(`${API_URL}/api/stats`, { cache: "no-store" });
+  const res = await fetch(`${API_URL}/api/stats`, { cache: "no-store", headers: authHeaders() });
   if (!res.ok) throw new Error(`Failed to fetch stats: ${res.status}`);
   return res.json();
 }

@@ -133,7 +133,7 @@ def scan():
             new_count += 1
 
             # Send WhatsApp suggestion card
-            job_card = {**job_data, **result}
+            job_card = {**job_data, **result, "job_hash": job_hash}
             ok = send_suggestion(job_card)
             if ok:
                 suggested_count += 1
@@ -385,29 +385,23 @@ def expire():
 
 
 @cli.command()
-def schedule():
-    """Start the scheduler — scans every 12 hours + runs webhook + hourly expiry."""
+@click.option("--scan-hours", default=6, show_default=True,
+              help="How often to scan for new jobs (hours).")
+def schedule(scan_hours):
+    """Start the full autonomous agent: scheduler + webhook server.
+
+    \b
+    Runs:
+      - Job scan every N hours (default 6) with 2h smart cooldown
+      - Expiry check + skipped-job re-notification every hour
+      - Inbound WhatsApp webhook on WEBHOOK_PORT (default 5000)
+    """
     import os
     import threading
-    from apscheduler.schedulers.blocking import BlockingScheduler
+    from core.scheduler import start_scheduler
     from webhook import app
-    from core.expiry import expire_old_suggestions
 
-    def run_scan():
-        from click.testing import CliRunner
-        runner = CliRunner()
-        result = runner.invoke(scan)
-        logger.info(f"Scheduled scan output:\n{result.output}")
-
-    def run_expiry():
-        expired = expire_old_suggestions()
-        if expired > 0:
-            logger.info(f"Expiry check: {expired} suggestions expired")
-
-    scheduler = BlockingScheduler()
-    scheduler.add_job(run_scan, "interval", hours=12, id="scan_job")
-    scheduler.add_job(run_scan, "date", id="scan_immediate")  # run once on startup
-    scheduler.add_job(run_expiry, "interval", hours=1, id="expiry_job")
+    scheduler = start_scheduler(scan_interval_hours=scan_hours)
 
     port = int(os.environ.get("WEBHOOK_PORT", 5000))
     webhook_thread = threading.Thread(
@@ -415,9 +409,39 @@ def schedule():
         daemon=True,
     )
     webhook_thread.start()
-    click.echo(f"Scheduler started. Webhook on port {port}. Scanning every 12h. Expiry every 1h.")
-    click.echo("Expose webhook: ngrok http {port}")
-    scheduler.start()
+
+    click.echo(f"JobTracker agent running.")
+    click.echo(f"  Scan interval : every {scan_hours}h (with 2h cooldown)")
+    click.echo(f"  Expiry/re-notify: every 1h")
+    click.echo(f"  Webhook       : http://0.0.0.0:{port}/webhook")
+    click.echo(f"  Expose via    : ngrok http {port}")
+    click.echo("Press Ctrl+C to stop.")
+
+    try:
+        # Keep main thread alive
+        import time
+        while True:
+            time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        from core.scheduler import stop_scheduler
+        stop_scheduler()
+        click.echo("Scheduler stopped.")
+
+
+@cli.command("linkedin-login")
+def linkedin_login():
+    """Open a browser to log in to LinkedIn manually — no password stored."""
+    from scanners.linkedin import interactive_login
+
+    click.echo("Opening browser for LinkedIn login...")
+    click.echo("Log in with your credentials in the browser window.")
+    click.echo("Your session will be saved automatically — no password is stored on disk.")
+
+    success = asyncio.run(interactive_login())
+    if success:
+        click.echo("LinkedIn session saved successfully! You can now run scans.")
+    else:
+        click.echo("Login failed or timed out. Please try again.")
 
 
 if __name__ == "__main__":

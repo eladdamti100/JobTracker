@@ -44,3 +44,7 @@ dashboard/.env.local
 # OS
 .DS_Store
 Thumbs.db
+
+# ngrok
+ngrok.exe
+ngrok
