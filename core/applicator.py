@@ -412,9 +412,17 @@ Return ONLY valid JSON in this format:
 
 
 def _generate_cover_letter(client: anthropic.Anthropic, job_title: str, company: str,
-                           job_description: str) -> str:
-    """Generate a short, tailored cover letter using Claude."""
+                           job_description: str, user_instruction: str = "") -> str:
+    """Generate a short, tailored cover letter using Claude.
+
+    user_instruction: optional free-text guidance from the user
+    (e.g. "emphasize Docker experience", "mention my open-source project").
+    """
     answers = _get_answers()
+    instruction_line = (
+        f"\nUser instruction: \"{user_instruction}\" — incorporate this emphasis into the letter."
+        if user_instruction else ""
+    )
     prompt = f"""Write a short cover letter (60-90 words) for this job application.
 Use this exact style and tone as a reference:
 
@@ -434,7 +442,7 @@ Description: {job_description[:1500]}
 
 Candidate skills: C++, Python, Backend, REST APIs, React, Node.js, MongoDB, Docker, Linux
 Military: IDF C4I — Networking Instructor & Team Lead
-
+{instruction_line}
 Rules:
 - Keep the same casual, honest, student tone as the reference
 - Start with "Hi," on its own line
@@ -1106,9 +1114,11 @@ def _find_navigation_button(page: Page, texts: list[str]) -> str | None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
-                 job_description: str, auto_submit: bool = False) -> dict:
+                 job_description: str, auto_submit: bool = False,
+                 user_instruction: str = "") -> dict:
     """Apply to a job by filling out the application form.
 
+    user_instruction: optional guidance from the user injected into cover letter
     Returns dict with keys: success, screenshots, cover_letter, error
     """
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -1235,7 +1245,7 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
             # ── PHASE 4: Generate cover letter ───────────────────────────
             step += 1
             _step(step, "Generating cover letter with Claude...")
-            cover_letter = _generate_cover_letter(client, job_title, company, job_description or "")
+            cover_letter = _generate_cover_letter(client, job_title, company, job_description or "", user_instruction)
             result["cover_letter"] = cover_letter
             step += 1
             _step(step, f"Cover letter generated:\n          \"{cover_letter}\"")

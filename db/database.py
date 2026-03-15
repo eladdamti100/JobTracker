@@ -16,7 +16,21 @@ def init_db():
     engine = get_engine()
     Base.metadata.create_all(engine)
     _migrate_legacy(engine)
+    _seed_conversation_state(engine)
     return engine
+
+
+def _seed_conversation_state(engine):
+    """Ensure exactly one ConversationState row exists."""
+    from db.models import ConversationState
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    try:
+        if not session.query(ConversationState).first():
+            session.add(ConversationState(state="idle"))
+            session.commit()
+    finally:
+        session.close()
 
 
 def _migrate_legacy(engine):

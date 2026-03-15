@@ -3,6 +3,7 @@ from sqlalchemy import Column, String, Integer, Float, DateTime, Text, JSON
 from sqlalchemy.orm import declarative_base
 from datetime import datetime, timezone, timedelta
 
+
 Base = declarative_base()
 
 
@@ -72,6 +73,27 @@ class Application(Base):
 
     def __repr__(self):
         return f"<Application {self.job_hash[:8]}: {self.company} - {self.title} [{self.status}]>"
+
+
+class ConversationState(Base):
+    """Single-row table tracking the current WhatsApp conversation state.
+
+    States:
+      idle              — no active conversation
+      awaiting_feedback — user replied YES; waiting for instructions or confirmation
+      pending_field     — applicator paused waiting for user answer to an unknown form field
+    """
+    __tablename__ = "conversation_state"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    state = Column(String, default="idle", nullable=False)
+    pending_job_hash = Column(String)       # set when awaiting_feedback
+    pending_field_label = Column(String)    # set when pending_field
+    field_answer = Column(Text)             # filled by webhook when user answers a field
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def __repr__(self):
+        return f"<ConversationState state={self.state!r} job={self.pending_job_hash}>"
 
 
 # Keep legacy Job model so existing DB table isn't orphaned
