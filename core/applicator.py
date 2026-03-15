@@ -16,6 +16,7 @@ import os
 import re
 import json
 import base64
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -1113,6 +1114,82 @@ def _find_navigation_button(page: Page, texts: list[str]) -> str | None:
 #  Main entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _ask_user_for_field_answer(field_label: str, company: str, title: str,
+                               timeout_seconds: int = 300) -> str | None:
+    """Send a WhatsApp message asking the user to fill an unknown form field.
+
+    Pauses the calling thread, polling ConversationState every 5 seconds
+    until the user replies (state == "field_answer_ready") or timeout expires.
+
+    Returns the user's answer string, or None on timeout.
+    """
+    from core.notifier import send_whatsapp
+    from db.database import get_session
+    from db.models import ConversationState
+
+    # Set state to pending_field so webhook knows to capture next reply
+    session = get_session()
+    try:
+        row = session.query(ConversationState).first()
+        if row:
+            row.state = "pending_field"
+            row.pending_field_label = field_label
+            row.field_answer = None
+            from datetime import timezone as tz
+            row.updated_at = datetime.now(tz.utc)
+            session.commit()
+    finally:
+        session.close()
+
+    send_whatsapp(
+        f"❓ *{company} — {title}*\n\n"
+        f"נתקלתי בשאלה שאינה ב-default_answers:\n"
+        f"*\"{field_label}\"*\n\n"
+        f"שלח תשובה ואמשיך בהגשה. (timeout: 5 דקות)"
+    )
+
+    logger.info(f"Waiting for user answer to field: {field_label!r} (timeout={timeout_seconds}s)")
+    elapsed = 0
+    poll_interval = 5
+
+    while elapsed < timeout_seconds:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+        s = get_session()
+        try:
+            row = s.query(ConversationState).first()
+            if row and row.state == "field_answer_ready" and row.field_answer:
+                answer = row.field_answer
+                # Reset state
+                row.state = "idle"
+                row.pending_field_label = None
+                row.field_answer = None
+                s.commit()
+                logger.info(f"User answered field {field_label!r}: {answer[:80]}")
+                return answer
+        finally:
+            s.close()
+
+    # Timeout — reset state
+    logger.warning(f"Timeout waiting for user answer to field: {field_label!r}")
+    s2 = get_session()
+    try:
+        row = s2.query(ConversationState).first()
+        if row and row.state == "pending_field":
+            row.state = "idle"
+            row.pending_field_label = None
+            s2.commit()
+    finally:
+        s2.close()
+
+    send_whatsapp(
+        f"⏰ תם הזמן לשאלה: *\"{field_label}\"*\n"
+        f"ממשיך עם תשובת ברירת מחדל."
+    )
+    return None
+
+
 def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                  job_description: str, auto_submit: bool = False,
                  user_instruction: str = "") -> dict:
@@ -1370,6 +1447,21 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
 
                     _filled, step = _fill_field(page, field, value, step,
                                                 cover_letter=cover_letter)
+
+                    # WhatsApp fallback: required textarea with no value found
+                    if not _filled and field.get("required") and \
+                            field.get("type") == "textarea" and not value:
+                        step += 1
+                        _step(step, f"Required textarea \"{field_label}\" has no answer — asking user via WhatsApp")
+                        user_answer = _ask_user_for_field_answer(
+                            field_label, company, job_title)
+                        if user_answer:
+                            _step(step, f"User provided answer: \"{user_answer[:60]}\"")
+                            _filled, step = _fill_field(
+                                page, field, user_answer, step, cover_letter=cover_letter)
+                        else:
+                            _step(step, f"No answer received — leaving field empty")
+
                     page.wait_for_timeout(300)
 
                 # ── Consent checkboxes ────────────────────────────────────

@@ -160,6 +160,25 @@ def _spawn_apply_thread(job_hash: str, company: str, title: str,
     thread.start()
 
 
+def _handle_field_answer(text: str) -> str:
+    """Store the user's answer to an unknown form field and signal the applicator to resume."""
+    conv = _get_conversation_state()
+    if not conv or conv.state != "pending_field":
+        return "❌ לא ציפיתי לתשובה כרגע."
+
+    field_label = conv.pending_field_label or "שדה לא ידוע"
+    _set_conversation_state(
+        state="field_answer_ready",
+        job_hash=conv.pending_job_hash,
+        field_label=field_label,
+        field_answer=text.strip(),
+    )
+    return (
+        f"✅ קיבלתי! ממשיך למלא את הטופס...\n"
+        f"_(שדה: \"{field_label}\")_"
+    )
+
+
 def _handle_yes() -> str:
     """Stage 1: Approve the last suggested job, then ask for instructions."""
     from db.database import get_session
@@ -422,6 +441,7 @@ def webhook():
     # route everything (except global commands) into the feedback handler.
     conv = _get_conversation_state()
     in_feedback = conv and conv.state == "awaiting_feedback"
+    in_pending_field = conv and conv.state == "pending_field"
 
     # Global commands always work regardless of state
     if upper in ("NO", "לא", "N"):
@@ -444,8 +464,13 @@ def webhook():
             "⏰ *SKIP* — הזכר לי בעוד 12 שעות\n"
             "📊 *STATUS* — הצג סטטיסטיקות\n"
             "🔍 *SCAN* — סרוק משרות חדשות עכשיו\n\n"
-            "_לאחר YES: כתוב הנחיה, 'כן' להגשה ישירה, או 'המתן' לעצירה._"
+            "_לאחר YES: כתוב הנחיה, 'כן' להגשה ישירה, או 'המתן' לעצירה._\n"
+            "_אם המערכת שואלת שאלה מהטופס — כתוב תשובה ישירות._"
         )
+
+    elif in_pending_field:
+        # Applicator is paused waiting for the user to answer an unknown form field
+        reply = _handle_field_answer(incoming)
 
     elif in_feedback:
         # Any other message after YES → treat as feedback/instruction
