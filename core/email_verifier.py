@@ -182,6 +182,9 @@ def find_verification_email(platform_key: str = "generic",
                 if sender_match and subject_match:
                     logger.info(f"Found verification email: {_decode_subject(msg)}")
 
+                    # Mark as read so we don't pick it up again next call
+                    mail.store(msg_id, '+FLAGS', '\\Seen')
+
                     # Try to extract a verification code first
                     body_text = _get_email_body(msg)
                     code = _extract_verification_code(body_text)

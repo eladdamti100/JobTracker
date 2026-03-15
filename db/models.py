@@ -1,5 +1,5 @@
 import hashlib
-from sqlalchemy import Column, String, Integer, Float, DateTime, Text, JSON, ForeignKey
+from sqlalchemy import Column, String, Integer, Float, DateTime, Text, JSON, ForeignKey, Boolean
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime, timezone, timedelta
 
@@ -129,17 +129,83 @@ class CompanyCredential(Base):
 
     Stores email/password per platform so the applicator can log in
     automatically on repeat visits. Passwords are Fernet-encrypted.
+
+    auth_type values    : password | oauth | otp_required | mfa_required | unknown
+    account_status values: active | pending_verification | needs_reauth | blocked
     """
     __tablename__ = "company_credentials"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     platform_key = Column(String, unique=True, index=True)  # "workday", "generic:acme.com"
+    domain = Column(String, default="")
     email = Column(String, nullable=False)
     encrypted_password = Column(String, nullable=False)
+    auth_type = Column(String, default="password")
+    account_status = Column(String, default="active")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_used_at = Column(DateTime)
+    # backward-compat alias — kept so existing queries don't break
     last_used = Column(DateTime)
     login_success_count = Column(Integer, default=0)
     notes = Column(Text)
 
     def __repr__(self):
-        return f"<CompanyCredential {self.platform_key} ({self.email})>"
+        return f"<CompanyCredential {self.platform_key} ({self.email}) [{self.account_status}]>"
+
+
+class SessionStore(Base):
+    """Encrypted Playwright storage_state (cookies + localStorage) per domain.
+
+    Allows the applicator to resume authenticated sessions without re-logging in.
+    The raw storage_state is NEVER stored in plaintext — it is Fernet-encrypted.
+    """
+    __tablename__ = "session_store"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    domain = Column(String, unique=True, index=True)
+    platform_key = Column(String, default="")
+    encrypted_storage_state = Column(Text, nullable=False)
+    expires_at = Column(DateTime)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_used_at = Column(DateTime)
+
+    def __repr__(self):
+        return f"<SessionStore {self.domain} [{self.platform_key}]>"
+
+
+class ApplyCheckpoint(Base):
+    """Resumable state for an in-progress job application.
+
+    When the applicator needs to pause (OTP wait, CAPTCHA, manual review),
+    it writes a checkpoint here so the run can be resumed later without
+    starting over from the beginning.
+
+    current_state values (state machine):
+      init | navigating | pre_login | logging_in | signing_up | verifying_email |
+      filling_form | uploading_cv | submitting | awaiting_otp | awaiting_captcha |
+      awaiting_manual | success | failed
+    """
+    __tablename__ = "apply_checkpoints"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    suggested_job_id = Column(
+        String, ForeignKey("suggested_jobs.job_hash"), nullable=False, index=True
+    )
+    current_state = Column(String, default="init", nullable=False)
+    adapter_name = Column(String, default="generic")
+    attempt_count = Column(Integer, default=0)
+    last_error = Column(Text)
+    last_screenshot_path = Column(String)
+    metadata_json = Column(JSON)   # adapter-specific scratchpad (step count, field values, etc.)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    suggested_job = relationship("SuggestedJob")
+
+    def __repr__(self):
+        return (
+            f"<ApplyCheckpoint job={self.suggested_job_id[:8]} "
+            f"state={self.current_state} attempt={self.attempt_count}>"
+        )

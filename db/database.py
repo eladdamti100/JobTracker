@@ -37,6 +37,14 @@ def _seed_conversation_state(engine):
 def _migrate(engine):
     """Run all schema migrations."""
     _add_column_if_missing(engine, "suggested_jobs", "cv_variant", "VARCHAR")
+
+    # CompanyCredential new columns (Stage 1 — 2026-03-15)
+    _add_column_if_missing(engine, "company_credentials", "domain", "VARCHAR DEFAULT ''")
+    _add_column_if_missing(engine, "company_credentials", "auth_type", "VARCHAR DEFAULT 'password'")
+    _add_column_if_missing(engine, "company_credentials", "account_status", "VARCHAR DEFAULT 'active'")
+    _add_column_if_missing(engine, "company_credentials", "updated_at", "DATETIME")
+    _add_column_if_missing(engine, "company_credentials", "last_used_at", "DATETIME")
+
     _migrate_legacy_jobs(engine)
 
 

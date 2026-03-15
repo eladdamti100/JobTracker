@@ -1185,20 +1185,22 @@ def _find_navigation_button(page: Page, texts: list[str]) -> str | None:
 
 def _auto_verify_email(platform_key: str, page, client: OpenAI,
                        job_id: str, step: int, result: dict) -> tuple[bool, int]:
-    """Check inbox for verification email, click the link. Returns (verified, step)."""
+    """Check inbox for verification email. Handles both link and code types.
+
+    - Link: clicks it via HTTP request
+    - Code: enters it into the code field on the current page
+
+    Returns (verified, step).
+    """
     from core.email_verifier import auto_verify
 
     step += 1
-    _step(step, f"Checking inbox for {platform_key} verification email...")
+    _step(step, f"Checking inbox for {platform_key} verification email (up to 2 min)...")
 
-    verified = auto_verify(platform_key, max_wait=120)
-    if verified:
+    verify_result = auto_verify(platform_key, max_wait=120)
+    if not verify_result:
         step += 1
-        _step(step, "Email verified successfully via IMAP!")
-        return True, step
-    else:
-        step += 1
-        _step(step, "Could not find or click verification email")
+        _step(step, "Could not find verification email — notifying user")
         from core.notifier import send_whatsapp
         send_whatsapp(
             f"📧 Could not auto-verify email for *{platform_key}*.\n"
@@ -1206,6 +1208,81 @@ def _auto_verify_email(platform_key: str, page, client: OpenAI,
         )
         result["error"] = f"Email verification needed for {platform_key}"
         return False, step
+
+    if verify_result["type"] == "link":
+        # Link was already clicked by auto_verify
+        step += 1
+        _step(step, f"Email verified via link for {platform_key}")
+        return True, step
+
+    # Code type — need to navigate to code entry page first
+    code = verify_result["value"]
+    step += 1
+    _step(step, f"Got verification code: {code} — finding code entry field...")
+
+    # Amazon: click "Click here to resend the verification email" link
+    # which also reveals/navigates to the code entry form
+    resend_texts = [
+        "Click here to resend", "resend the verification", "Resend",
+        "Enter verification code", "Enter code", "verify your account",
+    ]
+    for text in resend_texts:
+        try:
+            link = page.locator(f'a:has-text("{text}"), button:has-text("{text}")').first
+            if link.is_visible():
+                link.click()
+                page.wait_for_timeout(3000)
+                step += 1
+                _step(step, f"Clicked resend/verify link")
+                break
+        except Exception:
+            continue
+
+    # Now look for the code input field
+    code_selectors = [
+        'input[name*="code"]', 'input[name*="otp"]', 'input[name*="verification"]',
+        'input[autocomplete="one-time-code"]',
+        'input[type="text"][maxlength="6"]', 'input[type="number"][maxlength="6"]',
+        'input[type="text"]',
+    ]
+    filled = False
+    for sel in code_selectors:
+        try:
+            field = page.locator(sel).first
+            if field.is_visible():
+                field.fill(code)
+                filled = True
+                break
+        except Exception:
+            continue
+
+    if not filled:
+        step += 1
+        _step(step, "Code input not found — notifying user")
+        from core.notifier import send_whatsapp
+        send_whatsapp(
+            f"📧 Please enter verification code *{code}* for *{platform_key}* manually."
+        )
+        result["error"] = "Could not enter verification code on page"
+        return False, step
+
+    # Submit the code
+    for btn_text in ["Verify", "Submit", "Continue", "Log in", "Sign in", "Next"]:
+        try:
+            btn = page.get_by_role("button", name=btn_text)
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click()
+                break
+        except Exception:
+            continue
+
+    page.wait_for_timeout(3000)
+    shot = _screenshot(page, job_id, "verify_code_result")
+    result["screenshots"].append(str(shot))
+
+    step += 1
+    _step(step, f"Verification code {code} submitted for {platform_key}")
+    return True, step
 
 
 def _handle_login_page(page, client: OpenAI, job_id: str, apply_url: str,

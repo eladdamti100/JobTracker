@@ -102,61 +102,42 @@ def _spawn_apply_thread(job_hash: str, company: str, title: str,
     """Spawn a background thread to run auto-apply and notify via WhatsApp."""
     def run_apply():
         from db.database import get_session as gs
-        from db.models import SuggestedJob as SJ, Application as App
-        from core.applicator import apply_to_job
+        from db.models import SuggestedJob as SJ
+        from core.orchestrator import run_application
         from core.notifier import send_whatsapp
-
-        result = apply_to_job(
-            job_id=job_hash[:8],
-            apply_url=apply_url,
-            job_title=title,
-            company=company,
-            job_description=description,
-            auto_submit=True,
-            user_instruction=user_instruction,
-        )
 
         s = gs()
         try:
             sj = s.query(SJ).filter_by(job_hash=job_hash).first()
-            if sj:
-                sj.status = "applied"
-
-            now = datetime.now(timezone.utc)
-            app_record = App(
-                job_hash=job_hash,
-                company=company,
-                title=title,
-                apply_url=apply_url,
-                applied_at=now,
-                application_method=result.get("application_result", "auto_apply")
-                    if result.get("application_result") == "easy_apply" else "auto_apply",
-            )
-
-            if result["success"]:
-                app_record.status = "success"
-                app_record.application_result = result.get("application_result", "success")
-                app_record.cover_letter_used = result.get("cover_letter")
-                screenshots = result.get("screenshots", [])
-                app_record.screenshot_path = screenshots[0] if screenshots else None
-                send_whatsapp(f"✅ הוגש בהצלחה! {company} — {title}")
-            else:
-                app_record.status = "failed"
-                app_record.application_result = "failed"
-                app_record.error_message = result.get("error", "Unknown error")
-                send_whatsapp(f"❌ ההגשה נכשלה: {company} — {title}\n{result.get('error', '')}")
-
-            s.add(app_record)
-            s.commit()
-        except Exception as e:
-            logger.error(f"Apply thread error: {e}")
-            s.rollback()
         finally:
             s.close()
-        # Reset conversation state after apply completes
-        _set_conversation_state("idle")
 
-    thread = threading.Thread(target=run_apply, daemon=True)
+        if not sj:
+            logger.error(f"_spawn_apply_thread: job {job_hash[:8]} not found in DB")
+            return
+
+        result = run_application(sj, auto_submit=True)
+
+        if result.success:
+            send_whatsapp(f"✅ הוגש בהצלחה! {company} — {title}")
+        else:
+            send_whatsapp(
+                f"❌ ההגשה נכשלה: {company} — {title}\n"
+                f"{result.error or ''}"
+            )
+
+        # (DB updates are handled inside run_application / the orchestrator)
+
+    def run_apply_wrapper():
+        try:
+            run_apply()
+        except Exception as e:
+            logger.error(f"Apply thread error: {e}")
+        finally:
+            # Reset conversation state after apply completes
+            _set_conversation_state("idle")
+
+    thread = threading.Thread(target=run_apply_wrapper, daemon=True)
     thread.start()
 
 
@@ -177,6 +158,71 @@ def _handle_field_answer(text: str) -> str:
         f"✅ קיבלתי! ממשיך למלא את הטופס...\n"
         f"_(שדה: \"{field_label}\")_"
     )
+
+
+def _handle_otp_answer(text: str) -> str:
+    """Store the user's OTP/verification code and signal the adapter to resume."""
+    conv = _get_conversation_state()
+    if not conv or conv.state != "pending_otp":
+        return "❌ לא ציפיתי לקוד כרגע."
+
+    platform = conv.pending_field_label or "האתר"
+    _set_conversation_state(
+        state="otp_ready",
+        job_hash=conv.pending_job_hash,
+        field_label=platform,
+        field_answer=text.strip(),
+    )
+    # Never echo the OTP back to avoid it appearing in chat history
+    return "✅ קיבלתי את הקוד, ממשיך..."
+
+
+def _handle_done() -> str:
+    """User confirms manual action is complete — resume the stalled application."""
+    from db.database import get_session
+    from db.models import ApplyCheckpoint, SuggestedJob
+    from core.orchestrator import ApplyState
+
+    conv = _get_conversation_state()
+    if not conv or conv.state != "pending_intervention" or not conv.pending_job_hash:
+        return "❌ אין פעולה ידנית ממתינה כרגע."
+
+    job_hash = conv.pending_job_hash
+    session = get_session()
+    try:
+        # Reset checkpoint to PLAN so the adapter re-opens and re-detects page state
+        cp = (
+            session.query(ApplyCheckpoint)
+            .filter_by(suggested_job_id=job_hash)
+            .first()
+        )
+        if cp:
+            cp.current_state = ApplyState.PLAN.value
+            cp.attempt_count = 0
+            cp.last_error = None
+            cp.metadata_json = {}
+            cp.updated_at = datetime.now(timezone.utc)
+
+        job = session.query(SuggestedJob).filter_by(job_hash=job_hash).first()
+        if not job:
+            session.commit()
+            _set_conversation_state("idle")
+            return "❌ לא מצאתי את המשרה בבסיס הנתונים."
+
+        company = job.company
+        title = job.title
+        apply_url = job.apply_url
+        description = job.description or ""
+        session.commit()
+    except Exception as exc:
+        logger.error(f"_handle_done error: {exc}")
+        return "❌ שגיאה פנימית — לא הצלחתי לאפס את המצב."
+    finally:
+        session.close()
+
+    _set_conversation_state("idle")
+    _spawn_apply_thread(job_hash, company, title, apply_url, description)
+    return f"▶️ ממשיך בהגשה ל-*{company}* — {title}..."
 
 
 def _handle_yes(job_hash_prefix: str = None) -> str:
@@ -481,6 +527,8 @@ def webhook():
     conv = _get_conversation_state()
     in_feedback = conv and conv.state == "awaiting_feedback"
     in_pending_field = conv and conv.state == "pending_field"
+    in_pending_otp = conv and conv.state == "pending_otp"
+    in_pending_intervention = conv and conv.state == "pending_intervention"
 
     # --- Button clicks with specific job hash take priority ---
     if button_action == "NO" and button_job_hash:
@@ -505,6 +553,9 @@ def webhook():
     elif upper == "SCAN":
         reply = _handle_scan()
 
+    elif upper in ("DONE", "סיום", "FINISHED", "COMPLETE"):
+        reply = _handle_done()
+
     elif upper in ("HELP", "עזרה", "?"):
         reply = (
             "🤖 *JobTracker — פקודות:*\n\n"
@@ -512,14 +563,27 @@ def webhook():
             "❌ *NO* — בטל / דחה\n"
             "⏰ *SKIP* — הזכר לי בעוד 12 שעות\n"
             "📊 *STATUS* — הצג סטטיסטיקות\n"
-            "🔍 *SCAN* — סרוק משרות חדשות עכשיו\n\n"
+            "🔍 *SCAN* — סרוק משרות חדשות עכשיו\n"
+            "▶️ *DONE* — המשך לאחר אימות ידני (CAPTCHA / מייל)\n\n"
             "_לאחר YES: כתוב הנחיה, 'כן' להגשה ישירה, או 'המתן' לעצירה._\n"
-            "_אם המערכת שואלת שאלה מהטופס — כתוב תשובה ישירות._"
+            "_אם המערכת שואלת קוד OTP — שלח את הקוד ישירות._\n"
+            "_אם המערכת מחכה לפעולה ידנית — שלח DONE לאחר שסיימת._"
         )
+
+    elif in_pending_otp:
+        # Adapter is waiting for the user to supply a verification/OTP code
+        reply = _handle_otp_answer(incoming)
 
     elif in_pending_field:
         # Applicator is paused waiting for the user to answer an unknown form field
         reply = _handle_field_answer(incoming)
+
+    elif in_pending_intervention and upper not in ("YES", "כן", "Y"):
+        # Waiting for DONE — any non-YES message is ignored with a reminder
+        reply = (
+            "⏳ ממתין לפעולה ידנית שלך.\n"
+            "שלח *DONE* לאחר שסיימת."
+        )
 
     elif in_feedback:
         # Any other message after YES → treat as feedback/instruction

@@ -15,12 +15,12 @@ from pathlib import Path
 from db.database import init_db, get_session, is_duplicate
 from db.models import SuggestedJob, Application, make_job_hash
 
-# Configure logging
-LOG_DIR = Path(__file__).parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-logger.add(LOG_DIR / "agent.log", rotation="10 MB", retention="30 days")
-
 load_dotenv()
+
+# Secure logging — must run before any other module emits log records.
+# Replaces the default loguru handler with a redacting filter on all sinks.
+from core.log_utils import setup_secure_logging
+setup_secure_logging(log_dir=Path(__file__).parent / "logs")
 
 
 def load_profile() -> dict:
@@ -267,61 +267,28 @@ def apply(job_hash, auto_mode, auto_submit):
 
 
 def _run_apply(session, suggested_job: SuggestedJob, auto_submit: bool = False):
-    """Execute the apply flow for a single job and record in applications table."""
-    from core.applicator import apply_to_job
+    """Execute the apply flow for a single job via the ApplyOrchestrator."""
+    from core.orchestrator import run_application
     from datetime import datetime, timezone
 
-    # Mark suggested job as being applied
-    suggested_job.status = "applied"
+    # Mark as in-progress immediately so the dashboard reflects activity
     suggested_job.responded_at = datetime.now(timezone.utc)
     session.commit()
-    click.echo(f"[DB] SuggestedJob status -> applied")
 
-    result = apply_to_job(
-        job_id=suggested_job.job_hash[:8],
-        apply_url=suggested_job.apply_url,
-        job_title=suggested_job.title,
-        company=suggested_job.company,
-        job_description=suggested_job.description or "",
-        auto_submit=auto_submit,
-    )
+    result = run_application(suggested_job, auto_submit=auto_submit)
 
-    now = datetime.now(timezone.utc)
-
-    # Create application record
-    app_record = Application(
-        job_hash=suggested_job.job_hash,
-        company=suggested_job.company,
-        title=suggested_job.title,
-        source=suggested_job.source,
-        apply_url=suggested_job.apply_url,
-        applied_at=now,
-        application_method="auto_apply",
-    )
-
-    if result["success"]:
-        app_record.application_result = result.get("application_result", "success")
-        app_record.status = "success"
-        app_record.cover_letter_used = result.get("cover_letter")
-        app_record.screenshot_path = result.get("screenshots", [None])[0] if result.get("screenshots") else None
-        click.echo(f"[DB] Application recorded: SUCCESS")
+    if result.success:
+        click.echo(f"[DB] Application recorded: SUCCESS (adapter={result.adapter_name})")
         click.echo(f"\nSuccessfully applied to {suggested_job.company} — {suggested_job.title}")
     else:
-        app_record.application_result = "failed"
-        app_record.status = "failed"
-        app_record.error_message = result.get("error", "Unknown error")
-        click.echo(f"[DB] Application recorded: FAILED — {app_record.error_message}")
-        click.echo(f"\nFailed to apply: {result.get('error')}")
+        click.echo(
+            f"[DB] Application recorded: FAILED — {result.error} "
+            f"(state={result.final_state.value})"
+        )
+        click.echo(f"\nFailed to apply: {result.error}")
 
-    session.add(app_record)
-    session.commit()
-
-    # Print screenshot paths
-    screenshots = result.get("screenshots", [])
-    if screenshots:
-        click.echo(f"\nScreenshots ({len(screenshots)}):")
-        for s in screenshots:
-            click.echo(f"  -> {s}")
+    if result.screenshot_path:
+        click.echo(f"\nScreenshot: {result.screenshot_path}")
 
 
 @cli.command()
