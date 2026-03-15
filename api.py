@@ -7,6 +7,7 @@ if sys.platform == "win32":
 
 import os
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,6 +24,25 @@ app = Flask(__name__)
 CORS(app, origins="*")
 
 init_db()
+
+
+# ---------------------------------------------------------------------------
+# API Key Authentication
+# ---------------------------------------------------------------------------
+
+def require_api_key(f):
+    """Protect routes with X-API-Key header or ?api_key= query param."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        expected = os.environ.get("API_KEY")
+        if not expected:
+            # No API_KEY configured — allow all (dev mode)
+            return f(*args, **kwargs)
+        key = request.headers.get("X-API-Key") or request.args.get("api_key")
+        if key != expected:
+            return jsonify({"error": "unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,6 +109,7 @@ def health():
 
 
 @app.route("/api/suggested")
+@require_api_key
 def list_suggested():
     session = get_session()
     try:
@@ -138,6 +159,7 @@ def list_suggested():
 
 
 @app.route("/api/suggested/<job_hash>")
+@require_api_key
 def get_suggested(job_hash):
     session = get_session()
     try:
@@ -150,6 +172,7 @@ def get_suggested(job_hash):
 
 
 @app.route("/api/suggested/<job_hash>", methods=["PATCH"])
+@require_api_key
 def update_suggested(job_hash):
     """Approve or reject a suggested job from the dashboard."""
     session = get_session()
@@ -178,6 +201,7 @@ def update_suggested(job_hash):
 # ---------------------------------------------------------------------------
 
 @app.route("/api/applications")
+@require_api_key
 def list_applications():
     session = get_session()
     try:
@@ -222,6 +246,7 @@ def list_applications():
 
 
 @app.route("/api/applications/<job_hash>")
+@require_api_key
 def get_application(job_hash):
     session = get_session()
     try:
@@ -238,6 +263,7 @@ def get_application(job_hash):
 # ---------------------------------------------------------------------------
 
 @app.route("/api/stats")
+@require_api_key
 def get_stats():
     session = get_session()
     try:
@@ -264,6 +290,25 @@ def get_stats():
             session.query(Application.status, func.count(Application.id))
             .group_by(Application.status).all()
         )
+        # Success rate per source
+        source_stats_rows = (
+            session.query(
+                Application.source,
+                Application.status,
+                func.count(Application.id),
+            )
+            .group_by(Application.source, Application.status)
+            .all()
+        )
+        success_rate_by_source = {}
+        for src, st, cnt in source_stats_rows:
+            if src not in success_rate_by_source:
+                success_rate_by_source[src] = {"success": 0, "failed": 0, "total": 0}
+            success_rate_by_source[src]["total"] += cnt
+            if st == "success":
+                success_rate_by_source[src]["success"] += cnt
+            elif st == "failed":
+                success_rate_by_source[src]["failed"] += cnt
 
         # Recent applications
         recent_apps = (
@@ -293,6 +338,7 @@ def get_stats():
             "applications": {
                 "total": app_total,
                 "by_status": app_by_status,
+                "success_rate_by_source": success_rate_by_source,
                 "recent": [_application_to_dict(a) for a in recent_apps],
             },
         })

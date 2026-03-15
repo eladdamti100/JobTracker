@@ -82,6 +82,26 @@ def send_suggestions(jobs: list[dict], delay_sec: float = 1.0) -> tuple[int, int
     return sent, failed
 
 
+def send_application_result(company: str, title: str, success: bool,
+                            error_message: str = "", screenshot_path: str = "") -> bool:
+    """Notify the user about the result of an auto-application via WhatsApp."""
+    if success:
+        msg = (
+            f"✅ *הגשה הצליחה!*\n\n"
+            f"🏢 *{company}* — {title}\n"
+            f"ההגשה בוצעה בהצלחה."
+        )
+    else:
+        msg = (
+            f"❌ *הגשה נכשלה*\n\n"
+            f"🏢 *{company}* — {title}\n"
+            f"שגיאה: {error_message[:300]}"
+        )
+        if screenshot_path:
+            msg += f"\n📸 צילום מסך: {screenshot_path}"
+    return send_whatsapp(msg)
+
+
 # Legacy aliases for backwards compatibility
 def format_job_card(job: dict) -> str:
     return format_suggestion_card(job)

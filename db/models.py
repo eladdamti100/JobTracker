@@ -1,6 +1,6 @@
 import hashlib
-from sqlalchemy import Column, String, Integer, Float, DateTime, Text, JSON
-from sqlalchemy.orm import declarative_base
+from sqlalchemy import Column, String, Integer, Float, DateTime, Text, JSON, ForeignKey
+from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime, timezone, timedelta
 
 
@@ -41,10 +41,16 @@ class SuggestedJob(Base):
     # Lifecycle: suggested → approved → rejected → skipped → expired → applied
     status = Column(String, default="suggested", index=True)
 
+    # CV variant (e.g. "CV-Backend", "CV-DevOps") — None means default CV
+    cv_variant = Column(String, nullable=True)
+
     # Timestamps
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     expires_at = Column(DateTime, default=lambda: datetime.now(timezone.utc) + timedelta(hours=24))
     responded_at = Column(DateTime)
+
+    # Relationship
+    applications = relationship("Application", back_populates="suggested_job")
 
     def __repr__(self):
         return f"<SuggestedJob {self.job_hash[:8]}: {self.company} - {self.title} [{self.status}]>"
@@ -54,7 +60,7 @@ class Application(Base):
     __tablename__ = "applications"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    job_hash = Column(String, nullable=False, index=True)
+    job_hash = Column(String, ForeignKey("suggested_jobs.job_hash"), nullable=False, index=True)
     company = Column(String, nullable=False)
     title = Column(String, nullable=False)
     source = Column(String)
@@ -70,6 +76,9 @@ class Application(Base):
     screenshot_path = Column(String)
     cover_letter_used = Column(Text)
     error_message = Column(Text)
+
+    # Relationship
+    suggested_job = relationship("SuggestedJob", back_populates="applications")
 
     def __repr__(self):
         return f"<Application {self.job_hash[:8]}: {self.company} - {self.title} [{self.status}]>"
@@ -96,41 +105,20 @@ class ConversationState(Base):
         return f"<ConversationState state={self.state!r} job={self.pending_job_hash}>"
 
 
-# Keep legacy Job model so existing DB table isn't orphaned
-class Job(Base):
-    __tablename__ = "jobs"
+class ATSFieldMemory(Base):
+    """Cache discovered form field mappings per ATS platform.
+
+    After a successful application, the CSS selectors and field mappings
+    are saved here. On subsequent applications to the same ATS, cached
+    mappings are tried first — skipping the expensive Claude Vision call.
+    """
+    __tablename__ = "ats_field_memory"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    job_id = Column(String, unique=True, nullable=False, index=True)
-    title = Column(String, nullable=False)
-    company = Column(String, nullable=False)
-    location = Column(String)
-    description = Column(Text)
-    apply_url = Column(String)
-    date_posted = Column(String)
-    salary = Column(String)
-    score = Column(Float)
-    reason = Column(Text)
-    level = Column(String)
-    role_type = Column(String)
-    tech_stack_match = Column(JSON)
-    is_student_position = Column(Integer)
-    apply_strategy = Column(String)
-    role_summary = Column(Text)
-    requirements_summary = Column(Text)
-    status = Column(String, default="new", index=True)
-    cover_letter_used = Column(Text)
-    error_message = Column(Text)
-    application_method = Column(String)
-    application_result = Column(String)
-    source = Column(String)
-    notes = Column(Text)
-    referral_type = Column(String)
-    referral_url = Column(String)
-    found_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    notified_at = Column(DateTime)
-    applied_at = Column(DateTime)
-    status_updated_at = Column(DateTime)
+    ats_key = Column(String, unique=True, index=True)  # e.g. "comeet", "greenhouse"
+    field_mappings = Column(JSON)   # {canonical_field: {label, type, selector}}
+    success_count = Column(Integer, default=1)
+    last_used = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     def __repr__(self):
-        return f"<Job {self.job_id}: {self.company} - {self.title} [{self.status}]>"
+        return f"<ATSFieldMemory {self.ats_key} (success_count={self.success_count})>"

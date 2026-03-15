@@ -428,5 +428,21 @@ def schedule(scan_hours):
         click.echo("Scheduler stopped.")
 
 
+@cli.command("linkedin-login")
+def linkedin_login():
+    """Open a browser to log in to LinkedIn manually — no password stored."""
+    from scanners.linkedin import interactive_login
+
+    click.echo("Opening browser for LinkedIn login...")
+    click.echo("Log in with your credentials in the browser window.")
+    click.echo("Your session will be saved automatically — no password is stored on disk.")
+
+    success = asyncio.run(interactive_login())
+    if success:
+        click.echo("LinkedIn session saved successfully! You can now run scans.")
+    else:
+        click.echo("Login failed or timed out. Please try again.")
+
+
 if __name__ == "__main__":
     cli()
