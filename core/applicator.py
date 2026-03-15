@@ -1,4 +1,4 @@
-"""Auto form-filling and job application via Playwright + Claude Vision.
+"""Auto form-filling and job application via Playwright + Groq Vision.
 
 Architecture:
 - Central answer database: data/default_answers.yaml
@@ -7,7 +7,7 @@ Architecture:
 - Dropdown / radio / checkbox handling
 - Pre-submit validation: refuse to submit if required fields empty
 - Multi-page form loop with Next/Submit detection
-- Claude Vision for field identification and page state analysis
+- Groq Vision for field identification and page state analysis
 
 Supports: Breezy, Greenhouse, Lever, Ashby, Workday, SmartRecruiters, etc.
 """
@@ -21,7 +21,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-import anthropic
+from openai import OpenAI
 import yaml
 from loguru import logger
 from playwright.sync_api import sync_playwright, Page
@@ -344,13 +344,13 @@ def lookup_answer(field_label: str, candidate_field: str = "",
     """Look up the answer for a field from the central answer database.
 
     Priority:
-    1. candidate_field from Claude Vision (if it maps to an answer)
+    1. candidate_field from Groq Vision (if it maps to an answer)
     2. Normalized field label
     3. Smart defaults based on field type
     """
     answers = _get_answers()
 
-    # 1. Try candidate_field directly (from Claude Vision analysis)
+    # 1. Try candidate_field directly (from Groq Vision analysis)
     if candidate_field and candidate_field in answers:
         return str(answers[candidate_field])
 
@@ -395,7 +395,7 @@ def _image_to_base64(path: Path) -> str:
 
 
 def _parse_json_response(raw: str) -> dict:
-    """Strip markdown fences and parse JSON from Claude response."""
+    """Strip markdown fences and parse JSON from Groq response."""
     text = raw.strip()
     if not text:
         return {}
@@ -419,23 +419,21 @@ def _parse_json_response(raw: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Claude Vision helpers
+#  Groq Vision helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _ask_claude_vision(client: anthropic.Anthropic, screenshot_b64: str, prompt: str) -> str:
-    """Send a screenshot to Claude Vision and get a text response."""
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+def _ask_grok_vision(client: OpenAI, screenshot_b64: str, prompt: str) -> str:
+    """Send a screenshot to Groq Vision and get a text response."""
+    response = client.chat.completions.create(
+        model="llama-3.2-90b-vision-preview",
         max_tokens=2000,
         messages=[{
             "role": "user",
             "content": [
                 {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": screenshot_b64,
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{screenshot_b64}",
                     },
                 },
                 {
@@ -445,11 +443,11 @@ def _ask_claude_vision(client: anthropic.Anthropic, screenshot_b64: str, prompt:
             ],
         }],
     )
-    return message.content[0].text.strip()
+    return (response.choices[0].message.content or "").strip()
 
 
-def _identify_fields(client: anthropic.Anthropic, screenshot_path: Path) -> dict:
-    """Use Claude Vision to identify form fields from a screenshot."""
+def _identify_fields(client: OpenAI, screenshot_path: Path) -> dict:
+    """Use Groq Vision to identify form fields from a screenshot."""
     b64 = _image_to_base64(screenshot_path)
 
     prompt = """Analyze this job application form screenshot. Identify ALL visible form fields.
@@ -479,13 +477,13 @@ Return ONLY valid JSON in this format:
   "submit_button_text": "the text on the submit button if present"
 }"""
 
-    raw = _ask_claude_vision(client, b64, prompt)
+    raw = _ask_grok_vision(client, b64, prompt)
     return _parse_json_response(raw)
 
 
-def _generate_cover_letter(client: anthropic.Anthropic, job_title: str, company: str,
+def _generate_cover_letter(client: OpenAI, job_title: str, company: str,
                            job_description: str, user_instruction: str = "") -> str:
-    """Generate a short, tailored cover letter using Claude.
+    """Generate a short, tailored cover letter using Groq.
 
     user_instruction: optional free-text guidance from the user
     (e.g. "emphasize Docker experience", "mention my open-source project").
@@ -525,12 +523,12 @@ Rules:
 - Do NOT say "I am writing to express" or "I am excited to apply" or "Dear Hiring Team"
 - Keep it under 90 words (excluding greeting and sign-off)
 """
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}],
     )
-    return message.content[0].text.strip()
+    return (response.choices[0].message.content or "").strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1271,7 +1269,10 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
     cv_variant: optional CV file variant name (e.g. "CV-Backend")
     Returns dict with keys: success, screenshots, cover_letter, error
     """
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = OpenAI(
+        api_key=os.environ["GROQ_API_KEY"],
+        base_url="https://api.groq.com/openai/v1",
+    )
     ats_key = _extract_ats_key(apply_url)
     cv_path = _resolve_cv_path(cv_variant)
     result = {
@@ -1405,13 +1406,13 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                         step += 1
                         shot = _screenshot(page, job_id, "02_no_form_found")
                         result["screenshots"].append(str(shot))
-                        _step(step, "No form visible -- asking Claude Vision...")
-                        guidance = _ask_claude_vision_for_page_state(client, shot)
-                        _step(step + 1, f"Claude says: {guidance.get('message', 'unknown')}")
+                        _step(step, "No form visible -- asking Groq Vision...")
+                        guidance = _ask_grok_vision_for_page_state(client, shot)
+                        _step(step + 1, f"Groq says: {guidance.get('message', 'unknown')}")
                         step += 1
                         if guidance.get("status") == "has_button":
                             btn = guidance.get("button_text", "Apply")
-                            _step(step, f"Claude found button: \"{btn}\" -- clicking")
+                            _step(step, f"Groq found button: \"{btn}\" -- clicking")
                             try:
                                 _click_button(page, btn)
                                 page.wait_for_timeout(2000)
@@ -1421,7 +1422,7 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
 
             # ── PHASE 4: Generate cover letter ───────────────────────────
             step += 1
-            _step(step, "Generating cover letter with Claude...")
+            _step(step, "Generating cover letter with Groq...")
             cover_letter = _generate_cover_letter(client, job_title, company, job_description or "", user_instruction)
             result["cover_letter"] = cover_letter
             step += 1
@@ -1464,14 +1465,14 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                 shot = _screenshot(page, job_id, f"03_page{page_num}_before_fill")
                 result["screenshots"].append(str(shot))
 
-                # Identify fields — try ATS cache first, fall back to Claude Vision
+                # Identify fields — try ATS cache first, fall back to Groq Vision
                 step += 1
                 cached = _get_cached_fields(ats_key) if ats_key and page_num == 1 else None
                 if cached:
                     _step(step, f"Using cached ATS mapping for {ats_key}")
                     form_analysis = cached
                 else:
-                    _step(step, "Sending screenshot to Claude Vision for field detection...")
+                    _step(step, "Sending screenshot to Groq Vision for field detection...")
                     form_analysis = _identify_fields(client, shot)
                 fields = form_analysis.get("fields", [])
                 has_next = form_analysis.get("next_button", False)
@@ -1480,7 +1481,7 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                 submit_text = form_analysis.get("submit_button_text", "Submit")
 
                 step += 1
-                _step(step, f"Claude identified {len(fields)} fields:")
+                _step(step, f"Groq identified {len(fields)} fields:")
                 for f in fields:
                     req = " (required)" if f.get("required") else ""
                     norm = normalize_field_name(f.get("label", ""))
@@ -1695,16 +1696,16 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                             result["success"] = True
                             result["application_result"] = "success"
                         else:
-                            # Strategy 3: Claude Vision fallback
+                            # Strategy 3: Groq Vision fallback
                             step += 1
-                            _step(step, "No clear success text -- verifying with Claude Vision...")
-                            post = _ask_claude_vision_for_page_state(client, shot)
+                            _step(step, "No clear success text -- verifying with Groq Vision...")
+                            post = _ask_grok_vision_for_page_state(client, shot)
                             vis_status = post.get("status", "unknown")
                             msg = post.get("message", "")
 
                             if vis_status == "success":
                                 step += 1
-                                _step(step, f"Claude confirms success: {msg}")
+                                _step(step, f"Groq confirms success: {msg}")
                                 result["success"] = True
                                 result["application_result"] = "success"
                                 # Rename screenshot to success
@@ -1712,7 +1713,7 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                                 result["screenshots"].append(str(success_shot))
                             elif vis_status == "error":
                                 step += 1
-                                _step(step, f"Claude detected error: {msg}")
+                                _step(step, f"Groq detected error: {msg}")
                                 result["error"] = f"Post-submit error: {msg}"
                                 result["application_result"] = "failed"
                             else:
@@ -1734,7 +1735,7 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                     shot = _screenshot(page, job_id, f"04_page{page_num}_stuck")
                     result["screenshots"].append(str(shot))
 
-                    guidance = _ask_claude_vision_for_page_state(client, shot)
+                    guidance = _ask_grok_vision_for_page_state(client, shot)
                     status = guidance.get("status", "unknown")
 
                     if status == "success":
@@ -1746,7 +1747,7 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                     elif status == "has_button":
                         btn = guidance.get("button_text", "Submit")
                         step += 1
-                        _step(step, f"Claude found button: \"{btn}\" -- clicking...")
+                        _step(step, f"Groq found button: \"{btn}\" -- clicking...")
                         try:
                             _click_button(page, btn)
                             page.wait_for_timeout(2000)
@@ -1783,13 +1784,13 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Helpers that need the Claude client
+#  Helpers that need the Groq client
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _find_and_click_apply_button_on_page(
-    page: Page, client: anthropic.Anthropic, job_id: str, step: int, result: dict
+    page: Page, client: OpenAI, job_id: str, step: int, result: dict
 ) -> tuple[bool, int]:
-    """Search for Apply button via DOM, then Claude Vision fallback."""
+    """Search for Apply button via DOM, then Groq Vision fallback."""
     _step(step, "Searching for Apply button...")
 
     for text in APPLY_BUTTON_TEXTS:
@@ -1813,15 +1814,15 @@ def _find_and_click_apply_button_on_page(
             except Exception:
                 continue
 
-    # Claude Vision fallback
+    # Groq Vision fallback
     step += 1
-    _step(step, "No standard Apply button found. Asking Claude Vision...")
+    _step(step, "No standard Apply button found. Asking Groq Vision...")
     shot = _screenshot(page, job_id, "02_apply_btn_search")
     result["screenshots"].append(str(shot))
     b64 = _image_to_base64(shot)
 
     try:
-        raw = _ask_claude_vision(
+        raw = _ask_grok_vision(
             client, b64,
             "I'm looking at a job posting page. I need to find the Apply button. "
             "Is there an Apply / Apply Now / Submit Application button visible? "
@@ -1831,23 +1832,23 @@ def _find_and_click_apply_button_on_page(
         if info.get("found"):
             btn_text = info.get("button_text", "Apply")
             step += 1
-            _step(step, f"Claude found Apply button: \"{btn_text}\" -> clicking")
+            _step(step, f"Groq found Apply button: \"{btn_text}\" -> clicking")
             _click_button(page, btn_text)
             page.wait_for_timeout(1500)
             return True, step
     except Exception as e:
-        logger.debug(f"Claude Vision apply button detection failed: {e}")
+        logger.debug(f"Groq Vision apply button detection failed: {e}")
 
     step += 1
     _step(step, "No Apply button found -- assuming form is already visible")
     return False, step
 
 
-def _ask_claude_vision_for_page_state(client: anthropic.Anthropic, screenshot_path: Path) -> dict:
-    """Ask Claude Vision to analyze the current page state."""
+def _ask_grok_vision_for_page_state(client: OpenAI, screenshot_path: Path) -> dict:
+    """Ask Groq Vision to analyze the current page state."""
     b64 = _image_to_base64(screenshot_path)
     try:
-        raw = _ask_claude_vision(
+        raw = _ask_grok_vision(
             client, b64,
             "What is the current state of this page? Is this:\n"
             "- A success/confirmation page (application submitted)?\n"
@@ -1915,7 +1916,7 @@ LINKEDIN_FIELD_MAP = {
 
 def _fill_linkedin_easy_apply_modal(
     page: Page,
-    client: anthropic.Anthropic,
+    client: OpenAI,
     job_id: str,
     cover_letter: str,
     answers: dict,
@@ -1962,12 +1963,12 @@ def _fill_linkedin_easy_apply_modal(
         except Exception as e:
             logger.debug(f"Resume upload attempt: {e}")
 
-        # ── 2. Ask Claude Vision for field list ───────────────────────────
+        # ── 2. Ask Groq Vision for field list ───────────────────────────
         step += 1
-        _step(step, "Sending modal screenshot to Claude Vision for fields...")
+        _step(step, "Sending modal screenshot to Groq Vision for fields...")
         form_analysis = _identify_fields(client, shot)
         fields = form_analysis.get("fields", [])
-        _step(step, f"Claude found {len(fields)} fields in modal step {modal_page}")
+        _step(step, f"Groq found {len(fields)} fields in modal step {modal_page}")
 
         # ── 3. Fill each detected field ───────────────────────────────────
         for field in fields:
@@ -2035,10 +2036,10 @@ def _fill_linkedin_easy_apply_modal(
                         return True, step
                 except Exception:
                     pass
-            # Claude Vision final check
-            state = _ask_claude_vision_for_page_state(client, shot_final)
+            # Groq Vision final check
+            state = _ask_grok_vision_for_page_state(client, shot_final)
             if state.get("status") == "success":
-                _step(step, "Claude Vision confirmed: application submitted")
+                _step(step, "Groq Vision confirmed: application submitted")
                 return True, step
             _step(step, f"Submit clicked but outcome unclear: {state.get('message', '?')}")
             return True, step  # optimistic — form was submitted

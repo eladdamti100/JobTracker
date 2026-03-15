@@ -1,8 +1,8 @@
-"""Claude-powered job scoring and summarization against candidate profile."""
+"""Groq-powered job scoring and summarization against candidate profile."""
 
 import json
 import os
-import anthropic
+from openai import OpenAI
 from loguru import logger
 
 
@@ -111,7 +111,7 @@ def should_keep(result: dict) -> bool:
 
 
 async def score_job(job: dict, profile: dict) -> dict:
-    """Score and summarize a job listing against the candidate profile using Claude.
+    """Score and summarize a job listing against the candidate profile using Groq.
 
     Uses WA_SCORE_PROMPT for WhatsApp-sourced jobs (more generous scoring),
     and SCORE_PROMPT for hiremetech jobs.
@@ -122,7 +122,10 @@ async def score_job(job: dict, profile: dict) -> dict:
     """
     logger.info(f"Scoring: {job.get('title')} at {job.get('company')}")
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = OpenAI(
+        api_key=os.environ["GROQ_API_KEY"],
+        base_url="https://api.groq.com/openai/v1",
+    )
     profile_summary = _build_profile_summary(profile)
 
     # Use generous student-group prompt for WhatsApp and LinkedIn sourced jobs
@@ -146,13 +149,15 @@ async def score_job(job: dict, profile: dict) -> dict:
     )
 
     for attempt in range(2):
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             max_tokens=600,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
         )
-        raw = message.content[0].text.strip()
+        raw = (response.choices[0].message.content or "").strip()
 
         # Strip markdown code fences if present
         if raw.startswith("```"):
@@ -162,11 +167,11 @@ async def score_job(job: dict, profile: dict) -> dict:
             raw = raw.strip()
 
         if not raw:
-            logger.warning(f"Empty Claude response (attempt {attempt + 1}) for {job.get('company')}")
+            logger.warning(f"Empty Groq response (attempt {attempt + 1}) for {job.get('company')}")
             if attempt == 0:
                 import time; time.sleep(2)
                 continue
-            raise ValueError("Claude returned empty response after retry")
+            raise ValueError("Groq returned empty response after retry")
 
         try:
             result = json.loads(raw)
@@ -179,4 +184,4 @@ async def score_job(job: dict, profile: dict) -> dict:
                 continue
             raise
 
-    raise ValueError("Claude scoring failed after retry")
+    raise ValueError("Groq scoring failed after retry")
