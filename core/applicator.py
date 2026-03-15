@@ -1183,6 +1183,31 @@ def _find_navigation_button(page: Page, texts: list[str]) -> str | None:
 #  Login / Signup / 2FA handling
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _auto_verify_email(platform_key: str, page, client: OpenAI,
+                       job_id: str, step: int, result: dict) -> tuple[bool, int]:
+    """Check inbox for verification email, click the link. Returns (verified, step)."""
+    from core.email_verifier import auto_verify
+
+    step += 1
+    _step(step, f"Checking inbox for {platform_key} verification email...")
+
+    verified = auto_verify(platform_key, max_wait=120)
+    if verified:
+        step += 1
+        _step(step, "Email verified successfully via IMAP!")
+        return True, step
+    else:
+        step += 1
+        _step(step, "Could not find or click verification email")
+        from core.notifier import send_whatsapp
+        send_whatsapp(
+            f"📧 Could not auto-verify email for *{platform_key}*.\n"
+            f"Please check your inbox and verify manually."
+        )
+        result["error"] = f"Email verification needed for {platform_key}"
+        return False, step
+
+
 def _handle_login_page(page, client: OpenAI, job_id: str, apply_url: str,
                        step: int, result: dict) -> tuple[bool, int]:
     """Handle a login page: try stored credentials, or sign up.
@@ -1317,8 +1342,23 @@ def _perform_login(page, client: OpenAI, email: str, password: str,
     status = page_state.get("status", "unknown")
 
     if status == "login":
-        # Still on login page — credentials were wrong
+        # Still on login page — check if it's an email verification issue
         step += 1
+        page_text = page.inner_text("body")[:500].lower()
+        if any(kw in page_text for kw in ["hasn't been verified", "not verified",
+                                           "verify your email", "check your email",
+                                           "verification email", "confirm your email"]):
+            _step(step, "Email not verified — auto-verifying via IMAP...")
+            verified, step = _auto_verify_email(platform_key, page, client,
+                                                 job_id, step, result)
+            if verified:
+                # Retry login after verification
+                step += 1
+                _step(step, "Email verified — retrying login...")
+                page.reload()
+                page.wait_for_timeout(2000)
+                return _perform_login(page, client, email, password,
+                                      platform_key, job_id, step, result)
         _step(step, "Login failed — still on login page")
         return False, step
 
@@ -1502,6 +1542,19 @@ def _handle_signup_page(page, client: OpenAI, job_id: str, apply_url: str,
         step += 1
         _step(step, "Redirected to login after signup — trying to log in...")
         save_credential(platform_key, user_email, new_password)
+
+        # Check if email verification is needed (common after signup)
+        page_text = page.inner_text("body")[:500].lower()
+        if any(kw in page_text for kw in ["hasn't been verified", "not verified",
+                                           "verify your email", "check your email",
+                                           "verification email", "confirm your email"]):
+            step += 1
+            _step(step, "Email verification required — checking inbox...")
+            verified, step = _auto_verify_email(platform_key, page, client,
+                                                 job_id, step, result)
+            if not verified:
+                return False, step
+
         return _perform_login(page, client, user_email, new_password,
                               platform_key, job_id, step, result)
 
