@@ -1191,6 +1191,31 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                     result["screenshots"].append(str(shot))
                     _step(step, f"Screenshot after Apply click -> {shot.name}")
 
+                    # ── LinkedIn Easy Apply: modal opens in the same tab ──
+                    if on_linkedin_job_page and len(context.pages) == 1:
+                        modal_visible = False
+                        for sel in EASY_APPLY_MODAL_SELECTORS:
+                            try:
+                                if page.locator(sel).count() > 0:
+                                    modal_visible = True
+                                    break
+                            except Exception:
+                                pass
+                        if modal_visible:
+                            answers_dict = yaml.safe_load(ANSWERS_PATH.read_text(encoding="utf-8")) or {}
+                            cover_letter = _generate_cover_letter(
+                                client, job_title, company, job_description or "", user_instruction
+                            )
+                            result["cover_letter"] = cover_letter
+                            success, step = _fill_linkedin_easy_apply_modal(
+                                page, client, job_id, cover_letter,
+                                answers_dict, result, step, auto_submit=auto_submit,
+                            )
+                            result["success"] = success
+                            result["application_result"] = "easy_apply" if success else "failed"
+                            browser.close()
+                            return result
+
                     if len(context.pages) > 1:
                         step += 1
                         _step(step, "New tab detected -- switching to application tab")
@@ -1658,3 +1683,210 @@ def _ask_claude_vision_for_page_state(client: anthropic.Anthropic, screenshot_pa
     except Exception as e:
         logger.debug(f"Page state analysis failed: {e}")
         return {"status": "unknown", "message": str(e)}
+
+
+# ── LinkedIn Easy Apply ───────────────────────────────────────────────────────
+
+EASY_APPLY_MODAL_SELECTORS = [
+    "div.jobs-easy-apply-modal",
+    "div[data-test-modal-id='easy-apply-modal']",
+    "div[class*='easy-apply-modal']",
+    "div[aria-labelledby*='easy-apply']",
+]
+
+EASY_APPLY_BUTTON_SELECTORS = [
+    "button.jobs-apply-button",
+    "button[class*='jobs-apply-button']",
+    'button:has-text("Easy Apply")',
+    'button[aria-label*="Easy Apply"]',
+]
+
+EASY_APPLY_NEXT_SELECTORS = [
+    'button[aria-label="Continue to next step"]',
+    'button[aria-label="Submit application"]',
+    'footer button.artdeco-button--primary',
+    'div.jobs-easy-apply-modal button.artdeco-button--primary',
+]
+
+EASY_APPLY_SUCCESS_SELECTORS = [
+    'h3:has-text("Your application was sent")',
+    'h3:has-text("Application submitted")',
+    'div[class*="post-apply"]',
+    '[data-test-job-seeker-application-outcome-confirmation]',
+]
+
+LINKEDIN_FIELD_MAP = {
+    # The modal reuses LinkedIn profile data but shows editable inputs
+    "phone country code": "phone",
+    "mobile phone number": "phone",
+    "email address": "email",
+    "first name": "first_name",
+    "last name": "last_name",
+    "city": "city",
+    "linkedin profile url": "linkedin",
+    "website": "website",
+    "github": "github",
+    "years of experience": "years_of_experience",
+    "how many years": "years_of_experience",
+    "cover letter": "cover_letter",
+    "summary": "summary",
+    "salary": "salary_expectation",
+}
+
+
+def _fill_linkedin_easy_apply_modal(
+    page: Page,
+    client: anthropic.Anthropic,
+    job_id: str,
+    cover_letter: str,
+    answers: dict,
+    result: dict,
+    step: int,
+    auto_submit: bool = False,
+) -> tuple[bool, int]:
+    """Fill and submit a LinkedIn Easy Apply modal.
+
+    Steps through the multi-page modal using Next/Submit buttons.
+    Reuses existing _fill_field strategies for standard inputs.
+    Returns (success: bool, updated_step: int).
+    """
+    step += 1
+    _step(step, "LinkedIn Easy Apply modal detected — starting modal fill...")
+
+    max_modal_pages = 8
+    modal_page = 0
+
+    while modal_page < max_modal_pages:
+        modal_page += 1
+        step += 1
+        _step(step, f"--- Easy Apply modal step {modal_page} ---")
+
+        page.wait_for_timeout(1500)
+
+        shot = _screenshot(page, job_id, f"ea_{modal_page:02d}_before")
+        result["screenshots"].append(str(shot))
+
+        # ── 1. Handle resume/CV upload ────────────────────────────────────
+        try:
+            file_inputs = page.locator(
+                'input[type="file"][name*="resume"], '
+                'input[type="file"][accept*="pdf"], '
+                'input[type="file"]'
+            )
+            if file_inputs.count() > 0 and CV_PATH.exists():
+                fi = file_inputs.first
+                if fi.is_visible() or True:  # file inputs are often hidden
+                    fi.set_input_files(str(CV_PATH))
+                    step += 1
+                    _step(step, f"Resume uploaded: {CV_PATH.name}")
+                    page.wait_for_timeout(1000)
+        except Exception as e:
+            logger.debug(f"Resume upload attempt: {e}")
+
+        # ── 2. Ask Claude Vision for field list ───────────────────────────
+        step += 1
+        _step(step, "Sending modal screenshot to Claude Vision for fields...")
+        form_analysis = _identify_fields(client, shot)
+        fields = form_analysis.get("fields", [])
+        _step(step, f"Claude found {len(fields)} fields in modal step {modal_page}")
+
+        # ── 3. Fill each detected field ───────────────────────────────────
+        for field in fields:
+            label = field.get("label", "")
+            # Override candidate_field mapping for LinkedIn-specific labels
+            norm_lower = label.lower().strip()
+            for li_label, canonical in LINKEDIN_FIELD_MAP.items():
+                if li_label in norm_lower:
+                    field["candidate_field"] = canonical
+                    break
+
+            value = answers.get(field.get("candidate_field", ""), "")
+            _, step = _fill_field(page, field, value, step, cover_letter=cover_letter)
+
+        # ── 4. Consent / privacy checkboxes ──────────────────────────────
+        step = _check_consent_checkboxes(page, step)
+
+        # ── 5. Take post-fill screenshot ──────────────────────────────────
+        shot_after = _screenshot(page, job_id, f"ea_{modal_page:02d}_after")
+        result["screenshots"].append(str(shot_after))
+
+        # ── 6. Check for success page ─────────────────────────────────────
+        for sel in EASY_APPLY_SUCCESS_SELECTORS:
+            try:
+                if page.locator(sel).count() > 0:
+                    step += 1
+                    _step(step, "Easy Apply submitted successfully!")
+                    return True, step
+            except Exception:
+                pass
+
+        # ── 7. Detect Next vs Submit button ───────────────────────────────
+        has_next = form_analysis.get("next_button", False)
+        has_submit = form_analysis.get("submit_button", False)
+        next_text = form_analysis.get("next_button_text", "Next")
+        submit_text = form_analysis.get("submit_button_text", "Submit application")
+
+        # Also try LinkedIn-specific button selectors
+        primary_btn = page.locator(
+            'footer button.artdeco-button--primary, '
+            'div.jobs-easy-apply-modal button.artdeco-button--primary'
+        )
+
+        if has_submit or "review" in (next_text or "").lower():
+            step += 1
+            if not auto_submit:
+                _step(step, f"[DRY RUN] Would click Submit: \"{submit_text}\"")
+                result["application_result"] = "dry_run"
+                return True, step
+            _step(step, f"Clicking Submit: \"{submit_text}\"")
+            try:
+                _click_button(page, submit_text)
+            except Exception:
+                if primary_btn.count() > 0:
+                    primary_btn.last.click()
+            page.wait_for_timeout(3000)
+            shot_final = _screenshot(page, job_id, "ea_final_submit")
+            result["screenshots"].append(str(shot_final))
+            # Verify success
+            for sel in EASY_APPLY_SUCCESS_SELECTORS:
+                try:
+                    if page.locator(sel).count() > 0:
+                        step += 1
+                        _step(step, "Application submitted — success confirmed")
+                        return True, step
+                except Exception:
+                    pass
+            # Claude Vision final check
+            state = _ask_claude_vision_for_page_state(client, shot_final)
+            if state.get("status") == "success":
+                _step(step, "Claude Vision confirmed: application submitted")
+                return True, step
+            _step(step, f"Submit clicked but outcome unclear: {state.get('message', '?')}")
+            return True, step  # optimistic — form was submitted
+
+        elif has_next:
+            step += 1
+            _step(step, f"Clicking Next: \"{next_text}\"")
+            try:
+                _click_button(page, next_text)
+            except Exception:
+                if primary_btn.count() > 0:
+                    primary_btn.first.click()
+            page.wait_for_timeout(1500)
+        else:
+            # Try the primary button as a last resort
+            if primary_btn.count() > 0:
+                btn_text = primary_btn.first.inner_text().strip()
+                step += 1
+                _step(step, f"Clicking primary button: \"{btn_text}\"")
+                primary_btn.first.click()
+                page.wait_for_timeout(1500)
+                if "submit" in btn_text.lower() or "send" in btn_text.lower():
+                    return True, step
+            else:
+                step += 1
+                _step(step, "No Next/Submit button found — modal may be complete")
+                break
+
+    logger.warning("Easy Apply modal: reached max steps without confirmed submission")
+    return False, step

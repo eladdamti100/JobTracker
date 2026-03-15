@@ -129,7 +129,8 @@ def _spawn_apply_thread(job_hash: str, company: str, title: str,
                 title=title,
                 apply_url=apply_url,
                 applied_at=now,
-                application_method="auto_apply",
+                application_method=result.get("application_result", "auto_apply")
+                    if result.get("application_result") == "easy_apply" else "auto_apply",
             )
 
             if result["success"]:

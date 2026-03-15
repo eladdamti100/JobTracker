@@ -226,7 +226,17 @@ async def _extract_cards(page) -> list[dict]:
             );
             const snippet = snipEl ? snipEl.innerText.trim() : '';
 
-            results.push({ href, title, company, location, snippet });
+            // Easy Apply detection — LinkedIn marks these with a badge/method label
+            const easyApplyEl = card.querySelector(
+                '.job-card-container__apply-method, ' +
+                'li[class*="apply-method"], ' +
+                'span[class*="easy-apply"]'
+            );
+            const easyApplyText = card.innerText || '';
+            const isEasyApply = (easyApplyEl && easyApplyEl.innerText.includes('Easy Apply'))
+                || easyApplyText.includes('Easy Apply');
+
+            results.push({ href, title, company, location, snippet, isEasyApply });
         });
 
         return results;
@@ -372,6 +382,7 @@ async def scrape_linkedin(max_jobs: int = 40) -> list[dict]:
                 "posted_at": today_display,
                 "salary": None,
                 "source": "LinkedIn",
+                "is_easy_apply": bool(card.get("isEasyApply", False)),
             })
             await asyncio.sleep(0.5)
 
