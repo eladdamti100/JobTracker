@@ -18,6 +18,7 @@ import json
 import base64
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import anthropic
 import yaml
@@ -30,6 +31,76 @@ SCREENSHOTS_DIR = ROOT / "data" / "screenshots"
 CV_PATH = ROOT / "data" / "CV Resume.pdf"
 PROFILE_PATH = ROOT / "config" / "profile.yaml"
 ANSWERS_PATH = ROOT / "data" / "default_answers.yaml"
+
+# ── ATS platform keywords for cache key extraction ────────────────────────────
+ATS_KEYWORDS = [
+    "comeet", "greenhouse", "lever", "ashby", "workday", "smartrecruiters",
+    "breezyhr", "jazz", "bamboohr", "icims", "taleo", "jobvite",
+    "recruitee", "personio", "freshteam", "applytojob", "dover",
+]
+
+# ── ATS Field Memory helpers ──────────────────────────────────────────────────
+
+def _extract_ats_key(url: str) -> str | None:
+    """Extract ATS platform identifier from a URL hostname."""
+    host = urlparse(url).hostname or ""
+    host = host.lower()
+    for kw in ATS_KEYWORDS:
+        if kw in host:
+            return kw
+    return None
+
+
+def _get_cached_fields(ats_key: str) -> dict | None:
+    """Look up cached field mappings for an ATS. Returns None if not cached or untrusted."""
+    from db.database import get_session
+    from db.models import ATSFieldMemory
+    session = get_session()
+    try:
+        mem = session.query(ATSFieldMemory).filter_by(ats_key=ats_key).first()
+        if mem and mem.success_count >= 2:
+            logger.info(f"Using cached ATS mapping for {ats_key} (success_count={mem.success_count})")
+            return mem.field_mappings
+        return None
+    finally:
+        session.close()
+
+
+def _save_ats_fields(ats_key: str, field_mappings: dict):
+    """Upsert field mappings for an ATS platform after a successful application."""
+    from db.database import get_session
+    from db.models import ATSFieldMemory
+    session = get_session()
+    try:
+        mem = session.query(ATSFieldMemory).filter_by(ats_key=ats_key).first()
+        if mem:
+            mem.field_mappings = field_mappings
+            mem.success_count += 1
+            mem.last_used = datetime.now(timezone.utc)
+        else:
+            mem = ATSFieldMemory(
+                ats_key=ats_key,
+                field_mappings=field_mappings,
+                success_count=1,
+                last_used=datetime.now(timezone.utc),
+            )
+            session.add(mem)
+        session.commit()
+        logger.info(f"ATS field memory saved for {ats_key}")
+    finally:
+        session.close()
+
+
+def _resolve_cv_path(cv_variant: str | None = None) -> Path:
+    """Resolve the CV file path, supporting multiple CV versions."""
+    if cv_variant:
+        variant_path = ROOT / "data" / f"{cv_variant}.pdf"
+        if variant_path.exists():
+            logger.info(f"Using CV variant: {cv_variant}")
+            return variant_path
+        logger.warning(f"CV variant '{cv_variant}' not found at {variant_path}, using default")
+    return CV_PATH
+
 
 # ── Consent / checkbox keywords ───────────────────────────────────────────────
 CONSENT_KEYWORDS = [
@@ -1106,12 +1177,15 @@ def _find_navigation_button(page: Page, texts: list[str]) -> str | None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
-                 job_description: str, auto_submit: bool = False) -> dict:
+                 job_description: str, auto_submit: bool = False,
+                 cv_variant: str | None = None) -> dict:
     """Apply to a job by filling out the application form.
 
     Returns dict with keys: success, screenshots, cover_letter, error
     """
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    ats_key = _extract_ats_key(apply_url)
+    cv_path = _resolve_cv_path(cv_variant)
     result = {
         "success": False,
         "screenshots": [],
@@ -1277,10 +1351,15 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                 shot = _screenshot(page, job_id, f"03_page{page_num}_before_fill")
                 result["screenshots"].append(str(shot))
 
-                # Identify fields via Claude Vision
+                # Identify fields — try ATS cache first, fall back to Claude Vision
                 step += 1
-                _step(step, "Sending screenshot to Claude Vision for field detection...")
-                form_analysis = _identify_fields(client, shot)
+                cached = _get_cached_fields(ats_key) if ats_key and page_num == 1 else None
+                if cached:
+                    _step(step, f"Using cached ATS mapping for {ats_key}")
+                    form_analysis = cached
+                else:
+                    _step(step, "Sending screenshot to Claude Vision for field detection...")
+                    form_analysis = _identify_fields(client, shot)
                 fields = form_analysis.get("fields", [])
                 has_next = form_analysis.get("next_button", False)
                 has_submit = form_analysis.get("submit_button", False)
@@ -1564,6 +1643,13 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
 
         finally:
             browser.close()
+
+    # Save ATS field mappings on success for future reuse
+    if result["success"] and ats_key and form_analysis:
+        try:
+            _save_ats_fields(ats_key, form_analysis)
+        except Exception as e:
+            logger.warning(f"Failed to save ATS memory for {ats_key}: {e}")
 
     return result
 

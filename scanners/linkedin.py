@@ -1,13 +1,15 @@
 """LinkedIn Jobs scanner — scrapes software intern positions in Israel (last 24h).
 
 Uses Playwright to:
-  1. Login to LinkedIn (reuses saved session from data/linkedin_session.json)
+  1. Reuse saved session from data/linkedin_session.json (no password stored)
   2. Scrape the search results page for job URLs, titles, companies, locations
   3. Scrape each individual job page for the full description (one browser context reused)
 
 Job IDs: LI-{numeric_linkedin_id}
 
-Credentials: set LINKEDIN_EMAIL and LINKEDIN_PASSWORD in .env
+Session setup:  python main.py linkedin-login
+  Opens a visible browser — log in manually, session is saved automatically.
+  No credentials are stored on disk.
 """
 
 import re
@@ -71,6 +73,12 @@ async def _save_session(context: BrowserContext) -> None:
     SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
     cookies = await context.cookies()
     SESSION_FILE.write_text(json.dumps(cookies))
+    # Restrict file permissions (owner read/write only)
+    try:
+        import stat
+        SESSION_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+    except OSError:
+        pass  # Windows may not support chmod fully
     logger.info("LinkedIn session saved")
 
 
@@ -88,61 +96,79 @@ async def _load_session(context: BrowserContext) -> bool:
         return False
 
 
-async def _login(context: BrowserContext, email: str, password: str) -> bool:
-    """Login to LinkedIn. Returns True on success."""
-    page = await context.new_page()
-    try:
-        logger.info("Logging in to LinkedIn...")
-        await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(1500)
-        await page.fill("#username", email)
-        await page.fill("#password", password)
-        await page.click("button[type=submit]")
-        # Wait up to 15s for redirect away from login page
-        for _ in range(30):
-            await page.wait_for_timeout(500)
+async def interactive_login() -> bool:
+    """Open a visible browser for the user to log in manually.
+
+    The user logs in with their own hands — no credentials are stored.
+    Session cookies are saved to SESSION_FILE for future headless scraping.
+    """
+    logger.info("Opening browser for manual LinkedIn login...")
+    logger.info("Please log in to LinkedIn in the browser window that opens.")
+    logger.info("The session will be saved automatically once you're logged in.")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=False,  # visible browser
+            args=["--no-sandbox", "--disable-setuid-sandbox"],
+        )
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+        )
+        page = await context.new_page()
+        await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
+
+        # Poll until user completes login (up to 5 minutes)
+        logger.info("Waiting for you to log in (up to 5 minutes)...")
+        for _ in range(300):  # 300 x 1s = 5 min
+            await page.wait_for_timeout(1000)
             url = page.url
-            if "login" not in url and "checkpoint" not in url and "uas" not in url:
-                break
-        url = page.url
-        if not _is_logged_in_url(url):
-            logger.error(f"Login failed or security challenge at: {url}")
-            return False
-        logger.success(f"LinkedIn login successful — at: {url}")
-        await _save_session(context)
-        return True
-    except Exception as e:
-        logger.error(f"LinkedIn login error: {e}")
+            if _is_logged_in_url(url) and "feed" in url:
+                logger.success(f"Login detected — at: {url}")
+                await _save_session(context)
+                await browser.close()
+                logger.success("Session saved! You can now run scans without a password.")
+                return True
+
+        logger.error("Login timed out after 5 minutes")
+        await browser.close()
         return False
-    finally:
-        await page.close()
 
 
 async def _ensure_logged_in(context: BrowserContext) -> bool:
-    """Ensure we have a valid LinkedIn session. Returns True if logged in."""
-    email = os.environ.get("LINKEDIN_EMAIL", "")
-    password = os.environ.get("LINKEDIN_PASSWORD", "")
-    if not email or not password:
-        logger.warning("LINKEDIN_EMAIL / LINKEDIN_PASSWORD not set — scraping without login")
-        return False
-    # Try loading existing session and verify it's still valid
+    """Ensure we have a valid LinkedIn session. Returns True if logged in.
+
+    Uses only saved session cookies — no password is read or stored.
+    If session is expired, user must re-run: python main.py linkedin-login
+    """
     session_loaded = await _load_session(context)
-    if session_loaded:
-        page = await context.new_page()
-        try:
-            await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(1500)
-            url = page.url
-            if _is_logged_in_url(url):
-                logger.info("Existing LinkedIn session is valid")
-                return True
-            logger.info(f"Session expired (at {url}), re-logging in...")
-        except Exception as e:
-            logger.warning(f"Session check failed: {e}")
-        finally:
-            await page.close()
-    # Login fresh
-    return await _login(context, email, password)
+    if not session_loaded:
+        logger.warning(
+            "No LinkedIn session found. "
+            "Run 'python main.py linkedin-login' to log in via browser."
+        )
+        return False
+
+    # Verify the session is still valid
+    page = await context.new_page()
+    try:
+        await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(1500)
+        url = page.url
+        if _is_logged_in_url(url):
+            logger.info("Existing LinkedIn session is valid")
+            return True
+        logger.warning(
+            f"LinkedIn session expired (redirected to {url}). "
+            "Run 'python main.py linkedin-login' to re-authenticate."
+        )
+        return False
+    except Exception as e:
+        logger.warning(f"Session check failed: {e}")
+        return False
+    finally:
+        await page.close()
 
 
 async def _scroll_results(page) -> None:
