@@ -512,6 +512,23 @@ class AmazonAdapter(AdapterBase):
 
             submitted = False
 
+            # If fill_form already redirected to search/jobs page, the form was submitted
+            try:
+                cur_url = page.url
+                if ("amazon.jobs/en/search" in cur_url or "amazon.jobs/en/jobs" in cur_url
+                        or checkpoint_meta.get("redirect_to_search")):
+                    logger.info(f"[{job_id}] Already on search/jobs page — form was submitted during fill_form")
+                    shot = self._safe_screenshot("az_after_submit")
+                    if shot:
+                        self._screenshots.append(shot)
+                    return StepResult(
+                        ApplyState.SUCCESS, screenshot_path=shot,
+                        meta={"submitted": True, "confirmed": False,
+                              "redirect_to_search": True, "screenshots": self._screenshots},
+                    )
+            except Exception:
+                pass
+
             # Primary: Amazon-specific submit texts
             for text in ("Submit application", "Submit Application", "Submit", "Apply"):
                 for role in ("button",):
@@ -1486,8 +1503,7 @@ class AmazonAdapter(AdapterBase):
         try:
             from core.credential_manager import save_session_state
             cookies = self._context.cookies()
-            import json as _json
-            save_session_state(_SESSION_DOMAIN, _json.dumps({"cookies": cookies}))
+            save_session_state(_SESSION_DOMAIN, json.dumps({"cookies": cookies}))
             logger.info(f"[{self.job_hash[:8]}] Amazon session saved ({len(cookies)} cookies)")
         except Exception as exc:
             logger.debug(f"Session save failed: {exc}")

@@ -1242,7 +1242,6 @@ def _auto_verify_email(platform_key: str, page, client: OpenAI,
         "Click here to resend", "resend the verification", "Resend",
         "Enter verification code", "Enter code", "verify your account",
     ]
-    clicked_resend = False
     for text in resend_texts:
         try:
             link = page.locator(f'a:has-text("{text}"), button:has-text("{text}")').first
@@ -1251,7 +1250,6 @@ def _auto_verify_email(platform_key: str, page, client: OpenAI,
                 page.wait_for_timeout(3000)
                 step += 1
                 _step(step, "Clicked resend/verify link — waiting for fresh code in inbox...")
-                clicked_resend = True
                 break
         except Exception:
             continue
