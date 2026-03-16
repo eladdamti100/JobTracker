@@ -364,7 +364,10 @@ def load_session_state(domain: str) -> str | None:
         if not row:
             return None
         now = datetime.now(timezone.utc)
-        if row.expires_at and row.expires_at < now:
+        expires = row.expires_at
+        if expires and expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires and expires < now:
             logger.info(f"Session state for {domain} has expired — ignoring")
             return None
         row.last_used_at = now

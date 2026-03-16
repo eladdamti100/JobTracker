@@ -338,25 +338,27 @@ class ApplyOrchestrator:
         state = ApplyState(self._checkpoint.current_state)
         meta: dict = self._checkpoint.metadata_json or {}
 
-        # ── Crash recovery ────────────────────────────────────────────────────
-        # If we are resuming a non-fresh run (state is not PLAN and the checkpoint
-        # has prior attempts), the previous process's browser is gone.  Resuming
-        # mid-flow without a browser would crash immediately.  Reset to PLAN so
-        # the adapter re-opens the browser and re-detects the actual page state.
-        # The adapter's plan() is idempotent — it will navigate to the apply URL
-        # and choose the correct next state (skipping login if session is still live).
-        is_crash_resume = (
+        # ── Browser-less resume recovery ──────────────────────────────────────
+        # Every new process starts with no browser.  If the checkpoint has a
+        # mid-flow state (anything other than PLAN/DISCOVER/terminal/HUMAN_INTERVENTION),
+        # we MUST reset to PLAN so the adapter re-opens the browser and re-detects
+        # the actual page state.
+        #
+        # HUMAN_INTERVENTION is the only mid-flow state we deliberately keep —
+        # the user is expected to act and then send DONE, which resets the
+        # checkpoint to PLAN explicitly (see webhook._handle_done).
+        is_browser_less_resume = (
             state not in TERMINAL_STATES
-            and state not in {ApplyState.PLAN, ApplyState.DISCOVER}
-            and self._checkpoint.attempt_count > 0
+            and state not in {ApplyState.PLAN, ApplyState.DISCOVER,
+                              ApplyState.HUMAN_INTERVENTION}
         )
-        if is_crash_resume:
+        if is_browser_less_resume:
             logger.warning(
-                f"[{self.job.job_hash[:8]}] Resuming crashed run "
-                f"(last state={state.value}, attempt={self._checkpoint.attempt_count}) "
-                f"— resetting to PLAN to re-open browser"
+                f"[{self.job.job_hash[:8]}] New process, no browser — "
+                f"resetting from {state.value} → PLAN to re-open browser"
             )
             state = ApplyState.PLAN
+            self._checkpoint.attempt_count = 0
 
         logger.info(
             f"[{self.job.job_hash[:8]}] Orchestrator starting from state={state.value} "

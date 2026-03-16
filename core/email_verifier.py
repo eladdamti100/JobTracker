@@ -87,7 +87,25 @@ def _get_email_body(msg) -> str:
 
 
 def _extract_links(msg) -> list[str]:
-    """Extract all HTTP(S) links from an email message body."""
+    """Extract all HTTP(S) links from an email message body.
+
+    Extracts from both href attributes (HTML) and bare URLs (plain text).
+    HTML entity decoding is applied so &amp; → & doesn't break URLs.
+    """
+    import html as _html
+
+    def _from_body(body: str, is_html: bool) -> list[str]:
+        found = []
+        if is_html:
+            # 1. Extract href/src attribute values first (most reliable for HTML emails)
+            for attr_url in re.findall(r'href=["\']([^"\']+)["\']', body, re.I):
+                decoded = _html.unescape(attr_url).strip()
+                if decoded.startswith("http"):
+                    found.append(decoded)
+        # 2. Bare URL regex (catches plain-text and any href we missed)
+        found.extend(re.findall(r'https?://[^\s<>"\']+', body))
+        return found
+
     links = []
     if msg.is_multipart():
         for part in msg.walk():
@@ -95,16 +113,24 @@ def _extract_links(msg) -> list[str]:
             if ctype in ("text/plain", "text/html"):
                 try:
                     body = part.get_payload(decode=True).decode(errors="replace")
-                    links.extend(re.findall(r'https?://[^\s<>"\']+', body))
+                    links.extend(_from_body(body, is_html=(ctype == "text/html")))
                 except Exception:
                     pass
     else:
         try:
             body = msg.get_payload(decode=True).decode(errors="replace")
-            links.extend(re.findall(r'https?://[^\s<>"\']+', body))
+            ctype = msg.get_content_type()
+            links.extend(_from_body(body, is_html=(ctype == "text/html")))
         except Exception:
             pass
-    return links
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    result = []
+    for lnk in links:
+        if lnk not in seen:
+            seen.add(lnk)
+            result.append(lnk)
+    return result
 
 
 def _extract_verification_code(body_text: str) -> str | None:
@@ -134,13 +160,28 @@ def _is_verification_link(url: str) -> bool:
         "verify", "confirm", "activate", "validate", "registration",
         "token=", "code=", "key=", "hash=", "auth",
     ]
-    exclude = [
-        "unsubscribe", "privacy", "terms", "help", "support",
-        "logo", "image", "icon", ".png", ".jpg", ".gif", ".css",
+    # Trusted domains that always serve verification links
+    always_verify_domains = [
+        "passport.services.amazon.jobs",
+        "amazon.jobs/en/account/email_verify",
+        "click.amazon-jobs",
+    ]
+    if any(d in url_lower for d in always_verify_domains):
+        return True
+    # Exclude by file extension or clear social/junk domains
+    exclude_suffixes = [".png", ".jpg", ".jpeg", ".gif", ".css", ".svg", ".woff"]
+    exclude_domains = [
         "facebook.com", "twitter.com", "linkedin.com/company",
         "instagram.com", "youtube.com",
     ]
-    if any(ex in url_lower for ex in exclude):
+    exclude_path_words = ["unsubscribe", "privacy", "terms", "/help", "/support",
+                          "/logo", "/icon"]
+    if any(url_lower.endswith(sfx) or ("?" not in url_lower and sfx in url_lower)
+           for sfx in exclude_suffixes):
+        return False
+    if any(d in url_lower for d in exclude_domains):
+        return False
+    if any(w in url_lower for w in exclude_path_words):
         return False
     return any(kw in url_lower for kw in verify_keywords)
 
@@ -164,11 +205,32 @@ def find_verification_email(platform_key: str = "generic",
             mail = _connect()
             mail.select("INBOX")
 
-            today = datetime.now(timezone.utc).strftime("%d-%b-%Y")
-            _, msg_ids = mail.search(None, f'(SINCE "{today}")')
+            # Search last 2 days to handle UTC/local timezone edge cases
+            from datetime import timedelta
+            since_dt = datetime.now(timezone.utc) - timedelta(days=1)
+            since_str = since_dt.strftime("%d-%b-%Y")
+            _, msg_ids = mail.search(None, f'(SINCE "{since_str}")')
             ids = msg_ids[0].split()
 
-            for msg_id in reversed(ids[-20:]):
+            # Filter to emails received in the last 30 minutes by checking Date header
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+
+            recent_ids = []
+            for msg_id in ids:
+                _, hdr = mail.fetch(msg_id, "(BODY[HEADER.FIELDS (DATE)])")
+                raw_date = hdr[0][1].decode(errors="replace")
+                date_str = re.sub(r"Date:\s*", "", raw_date, flags=re.I).strip()
+                try:
+                    from email.utils import parsedate_to_datetime
+                    msg_dt = parsedate_to_datetime(date_str)
+                    if msg_dt.tzinfo is None:
+                        msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+                    if msg_dt >= cutoff:
+                        recent_ids.append(msg_id)
+                except Exception:
+                    recent_ids.append(msg_id)  # include if we can't parse date
+
+            for msg_id in reversed((recent_ids or ids)[-20:]):
                 _, data = mail.fetch(msg_id, "(RFC822)")
                 raw = data[0][1]
                 msg = email.message_from_bytes(raw)
@@ -250,8 +312,8 @@ def auto_verify(platform_key: str = "generic",
         return None
 
     if result["type"] == "link":
-        clicked = click_verification_link(result["value"])
-        if not clicked:
-            return None
+        # Best-effort HTTP click — even if it fails, return the URL so the
+        # caller can navigate the browser to it directly.
+        click_verification_link(result["value"])
 
     return result

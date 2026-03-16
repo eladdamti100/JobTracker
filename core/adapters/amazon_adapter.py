@@ -80,7 +80,7 @@ _PLATFORM_KEY     = "amazon"
 _PAGE_LOAD_TIMEOUT = 60_000
 _WAIT_AFTER_CLICK  = 1_500   # ms
 _WAIT_AFTER_NAV    = 3_000   # ms — Amazon's React forms are slower than average
-_MAX_FORM_PAGES    = 15
+_MAX_FORM_PAGES    = 30
 
 AMAZON_DOMAINS = (
     "amazon.jobs",
@@ -95,25 +95,32 @@ _SESSION_DOMAIN = "hiring.amazon.com"
 # ── Amazon-specific selectors ─────────────────────────────────────────────────
 
 AZ: dict[str, str] = {
-    # ── Amazon auth (ap/signin) ───────────────────────────────────────────────
-    "email":         'input#ap_email, input[name="email"]',
-    "password":      'input#ap_password, input[type="password"]',
-    "sign_in":       'input#signInSubmit, button[type="submit"]:has-text("Sign in"), '
-                     'button:has-text("Sign in")',
-    "otp":           'input#auth-mfa-otpcode, input[name="otpCode"], '
-                     'input[name="code"], input[autocomplete="one-time-code"]',
-    "otp_submit":    'input#auth-signin-button, button:has-text("Sign in"), '
-                     'button[type="submit"]',
-    "create_acct":   '#createAccountSubmit, a#ap-register-link, '
-                     'a:has-text("Create account"), '
-                     'a:has-text("Create an Amazon.jobs account"), '
-                     'button:has-text("Create account")',
-    # Signup form fields (Amazon account creation page)
+    # ── Amazon auth ───────────────────────────────────────────────────────────
+    # amazon.jobs uses its own form (not ap/signin).
+    # Email field: plain input[type="email"] — no special id
+    "email":         ('input[type="email"], '
+                      'input[name*="email" i], '
+                      'input#ap_email'),
+    "password":      'input[type="password"], input#ap_password',
+    # Log in button on amazon.jobs (orange button), fallback to generic submit
+    "sign_in":       ('button:has-text("Log in"), '
+                      'button:has-text("Sign in"), '
+                      'button[type="submit"], '
+                      'input#signInSubmit'),
+    "otp":           ('input#auth-mfa-otpcode, input[name="otpCode"], '
+                      'input[name="code"], input[autocomplete="one-time-code"]'),
+    "otp_submit":    ('input#auth-signin-button, button:has-text("Sign in"), '
+                      'button:has-text("Log in"), button[type="submit"]'),
+    "create_acct":   ('a:has-text("Create an Amazon.jobs account"), '
+                      'a:has-text("Create account"), '
+                      '#createAccountSubmit, a#ap-register-link, '
+                      'button:has-text("Create account")'),
+    # Signup form fields
     "signup_name":   'input#ap_customer_name, input[name="customerName"]',
-    "signup_email":  'input#ap_email, input[name="email"]',
-    "signup_pwd":    'input#ap_password, input[name="ap_password"]',
+    "signup_email":  'input[type="email"], input#ap_email, input[name*="email" i]',
+    "signup_pwd":    'input[type="password"], input#ap_password, input[name="ap_password"]',
     "signup_pwd2":   'input#ap_password_check, input[name="ap_password_check"]',
-    "signup_submit": 'input#continue, input[type="submit"]',
+    "signup_submit": 'button:has-text("Create account"), input#continue, input[type="submit"]',
 
     # ── Application form ──────────────────────────────────────────────────────
     "first_name":    'input[id*="firstName" i], input[name*="firstName" i], '
@@ -211,6 +218,19 @@ class AmazonAdapter(AdapterBase):
                 logger.info(f"[{self.job_hash[:8]}] Amazon session expired — need login")
                 return StepResult(ApplyState.LOGIN, screenshot_path=shot)
 
+            # If we're on the listing page (apply_button), navigate into the form first
+            if ps.kind == "apply_button":
+                logger.info(f"[{self.job_hash[:8]}] Session valid, on listing page — clicking Apply to enter form")
+                clicked = self._click_apply_button()
+                if clicked:
+                    try:
+                        self._page.wait_for_load_state("networkidle", timeout=15_000)
+                    except Exception:
+                        self._page.wait_for_timeout(_WAIT_AFTER_NAV)
+                    shot = self._safe_screenshot("az_session_on_form")
+                    if shot:
+                        self._screenshots.append(shot)
+
             logger.info(f"[{self.job_hash[:8]}] Amazon session valid — proceeding to form")
             return StepResult(ApplyState.FILL_FORM, screenshot_path=shot)
 
@@ -254,6 +274,8 @@ class AmazonAdapter(AdapterBase):
             )
         if result.success:
             mark_login_success(_PLATFORM_KEY)
+            # Save session so future runs skip login
+            self._save_session()
             self._navigate_to_apply()
             return StepResult(
                 ApplyState.FILL_FORM,
@@ -455,10 +477,16 @@ class AmazonAdapter(AdapterBase):
                 meta=result.metadata,
             )
         except Exception as exc:
+            exc_str = str(exc)
+            # TargetClosedError = browser/page closed after a click — likely submitted
+            if "TargetClosed" in type(exc).__name__ or "has been closed" in exc_str:
+                logger.info(f"[{self.job_hash[:8]}] Browser closed after form click — treating as submitted")
+                return StepResult(ApplyState.SUBMIT, success=True,
+                                  error=None, screenshot_path=None)
             logger.exception(f"[{self.job_hash[:8]}] AmazonAdapter.fill_form crashed: {exc}")
             shot = self._safe_screenshot("az_fill_crash")
             return StepResult(ApplyState.FAILED, success=False,
-                              error=str(exc), screenshot_path=shot)
+                              error=exc_str, screenshot_path=shot)
 
     def review(self, checkpoint_meta: dict) -> StepResult:
         """Amazon review step — screenshot and proceed to submit."""
@@ -651,20 +679,31 @@ class AmazonAdapter(AdapterBase):
         if self._detect_arkose_captcha(page):
             return PageState(kind="captcha")
 
-        # Amazon auth page URL patterns
         url = page.url.lower()
-        if "ap/signin" in url or "ap/register" in url:
-            # OTP/MFA page
-            if _visible(page, AZ["otp"]):
-                return PageState(kind="two_fa")
-            # Signup page — has name + email + 2x password
-            if _visible(page, AZ["signup_name"]) and _visible(page, AZ["signup_pwd2"]):
-                return PageState(kind="signup")
-            # Standard login page
-            if _visible(page, AZ["email"]) and _visible(page, AZ["password"]):
-                return PageState(kind="login")
 
-        # OTP on non-auth pages (e.g. inline step)
+        # ── Amazon job LISTING page (amazon.jobs/en/jobs/…) ──────────────────
+        # Must be checked BEFORE generic form detection because the listing page
+        # has a search bar <input> that dom_detect_page_state() mistakes for a form.
+        if "amazon.jobs/en/jobs/" in url and "/apply" not in url:
+            # Look for the Apply Now button/link on the listing page
+            for sel in (
+                'a[href*="/apply"]',
+                'a.apply-button',
+                'button.apply-button',
+                'a:has-text("Apply now")',
+                'a:has-text("Apply for this job")',
+            ):
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        text = loc.first.inner_text().strip() or "Apply now"
+                        return PageState(kind="apply_button", apply_button_text=text)
+                except Exception:
+                    continue
+            # Listing page loaded but no Apply button visible yet — still "apply_button"
+            return PageState(kind="apply_button", apply_button_text="Apply now")
+
+        # OTP on any page
         if _visible(page, AZ["otp"]):
             return PageState(kind="two_fa")
 
@@ -673,11 +712,17 @@ class AmazonAdapter(AdapterBase):
             return PageState(kind="captcha",
                              details={"reason": "assessment_required"})
 
-        # Explicit login page detection
+        # Auth page detection — covers both ap/signin AND amazon.jobs own login form
+        # amazon.jobs login: email + password on same page, "Log in" button
+        # ap/signin: same email+password structure
         if _visible(page, AZ["email"]) and _visible(page, AZ["password"]):
             if _visible(page, AZ["signup_pwd2"]):
                 return PageState(kind="signup")
             return PageState(kind="login")
+
+        # Signup-link only (no form yet) — e.g. amazon.jobs "Create an Amazon.jobs account"
+        if _visible(page, AZ["create_acct"]):
+            return PageState(kind="signup")
 
         # Success indicators
         if self._detect_amazon_success(page):
@@ -724,7 +769,13 @@ class AmazonAdapter(AdapterBase):
         if kind == "apply_button":
             clicked = self._click_apply_button(state.apply_button_text)
             if clicked:
-                self._page.wait_for_timeout(_WAIT_AFTER_CLICK)
+                # Wait for navigation to settle — Amazon may do multiple redirects
+                # (amazon.jobs → /apply → hiring.amazon.com or ap/signin)
+                try:
+                    self._page.wait_for_load_state("networkidle", timeout=15_000)
+                except Exception:
+                    self._page.wait_for_timeout(_WAIT_AFTER_NAV)
+                self._dismiss_popups()
                 shot2 = self._safe_screenshot("az_after_apply_click")
                 if shot2:
                     self._screenshots.append(shot2)
@@ -748,43 +799,32 @@ class AmazonAdapter(AdapterBase):
 
         try:
             # Amazon's two-step login: email first, then password on next page
-            # Step 1: fill email and click Continue
+            # Step 1: wait for auth page to load, then fill email
+            try:
+                self._page.wait_for_selector(AZ["email"], timeout=10_000)
+            except Exception:
+                pass  # proceed anyway — _fill_input will handle the None case
+
             if not self._fill_input(AZ["email"], email, "email"):
                 return AdapterResult.fail(
                     "signup", "Could not find Amazon email input"
                 )
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(400)
 
-            # Click Continue / Next (email-first step)
-            continue_btn = page.locator(
-                'input#continue, button:has-text("Continue"), '
-                'input[type="submit"]:not([id*="signIn"])'
-            )
-            if continue_btn.count() > 0 and continue_btn.first.is_visible():
-                continue_btn.first.click()
-                page.wait_for_timeout(2_000)
-
-            # Step 2: password
+            # amazon.jobs login is single-step: email + password on same page.
+            # There is no "Continue" click between them.
             if not self._fill_input(AZ["password"], password, "password"):
-                # If password field still not visible, try one-step login
-                if not self._fill_input('input[type="password"]', password, "password_generic"):
-                    return AdapterResult.fail(
-                        "failed", "Could not find Amazon password input"
-                    )
+                return AdapterResult.fail(
+                    "failed", "Could not find Amazon password input"
+                )
             page.wait_for_timeout(300)
 
-            # Sign in button
+            # Click "Log in" / "Sign in" button
             signed_in = False
             sign_in_loc = page.locator(AZ["sign_in"])
             if sign_in_loc.count() > 0 and sign_in_loc.first.is_visible():
                 sign_in_loc.first.click()
                 signed_in = True
-            if not signed_in:
-                # Fallback: any submit button
-                sub = page.locator('input[type="submit"], button[type="submit"]')
-                if sub.count() > 0 and sub.first.is_visible():
-                    sub.first.click()
-                    signed_in = True
 
             page.wait_for_timeout(4_000)
             shot = self._safe_screenshot("az_after_login")
@@ -1017,10 +1057,33 @@ class AmazonAdapter(AdapterBase):
         answers["cover_letter"] = self._cover_letter
         cv_path = self._resolve_cv()
         last_shot: str | None = None
+        last_url: str = ""
+        stuck_count: int = 0
 
         for page_num in range(1, _MAX_FORM_PAGES + 1):
             logger.info(f"[{job_id}] Amazon form page {page_num}")
             page.wait_for_timeout(1_500)
+
+            # ── Stuck-page detection ──────────────────────────────────────────
+            current_url = page.url
+            if current_url == last_url:
+                stuck_count += 1
+                if stuck_count >= 3:
+                    logger.warning(f"[{job_id}] Stuck on same page for {stuck_count} iterations: {current_url}")
+                    # Ask user to handle the stuck page
+                    from core.verifier import request_human_intervention
+                    request_human_intervention(
+                        self.job_hash, self.company, self.apply_url,
+                        "Form stuck on a page — there may be a required field or CAPTCHA. "
+                        "Please complete the form in the browser and send DONE",
+                    )
+                    return AdapterResult.need_human(
+                        f"Form stuck on page {page_num} — possible required field or CAPTCHA",
+                        screenshot_path=last_shot,
+                    )
+            else:
+                stuck_count = 0
+            last_url = current_url
 
             # ── Terminal / special state checks ───────────────────────────────
             if self._detect_amazon_success(page):
@@ -1096,7 +1159,25 @@ class AmazonAdapter(AdapterBase):
                                         metadata={"pages_filled": page_num})
 
             if nav == "next_clicked":
-                page.wait_for_timeout(2_500)
+                try:
+                    page.wait_for_timeout(2_500)
+                except Exception as nav_exc:
+                    # Browser may have closed or page navigated away — treat as success
+                    logger.info(f"[{job_id}] Page closed after next click (likely submitted): {nav_exc}")
+                    return AdapterResult.ok("submit", screenshot_path=last_shot,
+                                           metadata={"pages_filled": page_num})
+                # Check if we navigated away from the hiring form (possible success)
+                try:
+                    cur_url = page.url
+                    if "amazon.jobs/en/search" in cur_url or "amazon.jobs/en/jobs" in cur_url:
+                        if self._detect_amazon_success(page):
+                            return AdapterResult.ok("success", screenshot_path=last_shot)
+                        # Navigated to search — may have submitted
+                        logger.info(f"[{job_id}] Navigated to search after Next — possible success")
+                        return AdapterResult.ok("submit", screenshot_path=last_shot,
+                                               metadata={"pages_filled": page_num, "redirect_to_search": True})
+                except Exception:
+                    pass
                 continue
 
             if nav == "no_button":
@@ -1308,17 +1389,39 @@ class AmazonAdapter(AdapterBase):
                 continue
 
     def _click_apply_button(self, known_text: str | None = None) -> bool:
-        """Click the Apply button on a job listing page."""
+        """Click the Apply button on a job listing page.
+
+        amazon.jobs uses <a href="…/apply"> links, not <button> elements,
+        so we try CSS selector first, then ARIA role fallback.
+        """
+        page = self._page
+
+        # 1. CSS selector — fastest, works for amazon.jobs <a href="…/apply">
+        for sel in (
+            'a[href*="/apply"]',
+            'a.apply-button',
+            'button.apply-button',
+        ):
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    loc.first.click()
+                    logger.debug(f"[{self.job_hash[:8]}] Clicked apply via selector: {sel}")
+                    return True
+            except Exception:
+                continue
+
+        # 2. Text / role fallback
         texts = ([known_text] if known_text else []) + [
-            "Apply Now", "Apply for this job", "Apply", "Start application",
-            "Begin application",
+            "Apply now", "Apply Now", "Apply for this job", "Apply", "Start application",
         ]
         for text in texts:
-            for role in ("button", "link"):
+            for role in ("link", "button"):
                 try:
-                    loc = self._page.get_by_role(role, name=text, exact=False)
+                    loc = page.get_by_role(role, name=text, exact=False)
                     if loc.count() > 0 and loc.first.is_visible():
                         loc.first.click()
+                        logger.debug(f"[{self.job_hash[:8]}] Clicked apply via role+text: {text}")
                         return True
                 except Exception:
                     continue
@@ -1333,7 +1436,10 @@ class AmazonAdapter(AdapterBase):
             shot_dir = SCREENSHOTS_DIR / self.job_hash[:8]
             shot_dir.mkdir(parents=True, exist_ok=True)
             path = shot_dir / f"{name}.png"
-            self._page.screenshot(path=str(path), full_page=True)
+            try:
+                self._page.screenshot(path=str(path), full_page=True, timeout=8_000)
+            except Exception:
+                self._page.screenshot(path=str(path), full_page=False, timeout=5_000)
             return str(path)
         except Exception as exc:
             logger.debug(f"Screenshot failed ({name}): {exc}")
@@ -1374,6 +1480,17 @@ class AmazonAdapter(AdapterBase):
         except Exception as exc:
             logger.debug(f"Vision classify failed: {exc}")
             return PageState(kind="unknown", is_ambiguous=True)
+
+    def _save_session(self) -> None:
+        """Persist current browser cookies so future runs skip login."""
+        try:
+            from core.credential_manager import save_session_state
+            cookies = self._context.cookies()
+            import json as _json
+            save_session_state(_SESSION_DOMAIN, _json.dumps({"cookies": cookies}))
+            logger.info(f"[{self.job_hash[:8]}] Amazon session saved ({len(cookies)} cookies)")
+        except Exception as exc:
+            logger.debug(f"Session save failed: {exc}")
 
     def _resolve_cv(self):
         """Return the CV path from config."""

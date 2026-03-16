@@ -135,7 +135,6 @@ NEXT_BUTTON_TEXTS = [
 SUBMIT_BUTTON_TEXTS = [
     "Submit Application",
     "Submit",
-    "Apply",
     "Send Application",
     "Complete Application",
     "Finish",
@@ -381,11 +380,18 @@ def _step(step_num: int, msg: str):
 
 
 def _screenshot(page: Page, job_id: str, name: str) -> Path:
-    """Take a screenshot and save it."""
+    """Take a screenshot and save it. Returns path even if screenshot fails."""
     shot_dir = SCREENSHOTS_DIR / job_id
     shot_dir.mkdir(parents=True, exist_ok=True)
     path = shot_dir / f"{name}.png"
-    page.screenshot(path=str(path), full_page=True)
+    try:
+        page.screenshot(path=str(path), full_page=True, timeout=8_000)
+    except Exception:
+        try:
+            # Fallback: viewport only (no scroll — much faster)
+            page.screenshot(path=str(path), full_page=False, timeout=5_000)
+        except Exception:
+            pass  # Screenshot failed silently — don't crash the flow
     return path
 
 
@@ -448,6 +454,9 @@ def _ask_grok_vision(client: OpenAI, screenshot_b64: str, prompt: str) -> str:
 
 def _identify_fields(client: OpenAI, screenshot_path: Path) -> dict:
     """Use Groq Vision to identify form fields from a screenshot."""
+    if not screenshot_path.exists():
+        logger.debug(f"Screenshot missing for Vision, skipping: {screenshot_path}")
+        return {}
     b64 = _image_to_base64(screenshot_path)
 
     prompt = """Analyze this job application form screenshot. Identify ALL visible form fields.
@@ -1210,22 +1219,30 @@ def _auto_verify_email(platform_key: str, page, client: OpenAI,
         return False, step
 
     if verify_result["type"] == "link":
-        # Link was already clicked by auto_verify
+        # Link was already clicked by auto_verify via HTTP GET.
+        # Also navigate the browser to the link — Amazon requires the same session
+        # to complete the verification flow and redirect to the app.
+        link_url = verify_result["value"]
         step += 1
-        _step(step, f"Email verified via link for {platform_key}")
+        _step(step, f"Email verified via link for {platform_key} — navigating browser to verify URL")
+        try:
+            page.goto(link_url, wait_until="networkidle", timeout=30_000)
+            page.wait_for_timeout(2_000)
+        except Exception:
+            page.wait_for_timeout(3_000)
         return True, step
 
-    # Code type — need to navigate to code entry page first
-    code = verify_result["value"]
+    # Code type — need to get code input page first, then fetch fresh code.
+    # Strategy: click resend/enter-code link on the page FIRST so a NEW email
+    # is dispatched, THEN poll IMAP for the fresh code (old codes may be invalid).
     step += 1
-    _step(step, f"Got verification code: {code} — finding code entry field...")
+    _step(step, "Clicking resend/verify link to trigger fresh verification code...")
 
-    # Amazon: click "Click here to resend the verification email" link
-    # which also reveals/navigates to the code entry form
     resend_texts = [
         "Click here to resend", "resend the verification", "Resend",
         "Enter verification code", "Enter code", "verify your account",
     ]
+    clicked_resend = False
     for text in resend_texts:
         try:
             link = page.locator(f'a:has-text("{text}"), button:has-text("{text}")').first
@@ -1233,10 +1250,24 @@ def _auto_verify_email(platform_key: str, page, client: OpenAI,
                 link.click()
                 page.wait_for_timeout(3000)
                 step += 1
-                _step(step, f"Clicked resend/verify link")
+                _step(step, "Clicked resend/verify link — waiting for fresh code in inbox...")
+                clicked_resend = True
                 break
         except Exception:
             continue
+
+    # Re-fetch from IMAP for the freshest code (avoids using an expired/old code)
+    from core.email_verifier import find_verification_email as _find_email
+    fresh = _find_email(platform_key, max_wait=90, poll_interval=10)
+    if fresh and fresh["type"] == "code":
+        code = fresh["value"]
+        step += 1
+        _step(step, f"Got fresh verification code: {code}")
+    else:
+        # Fall back to the code we already found if no new one arrived
+        code = verify_result["value"]
+        step += 1
+        _step(step, f"Using existing verification code: {code}")
 
     # Now look for the code input field
     code_selectors = [
@@ -1278,7 +1309,7 @@ def _auto_verify_email(platform_key: str, page, client: OpenAI,
 
     page.wait_for_timeout(3000)
     shot = _screenshot(page, job_id, "verify_code_result")
-    result["screenshots"].append(str(shot))
+    result.setdefault("screenshots", []).append(str(shot))
 
     step += 1
     _step(step, f"Verification code {code} submitted for {platform_key}")
