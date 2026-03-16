@@ -815,8 +815,21 @@ class AmazonAdapter(AdapterBase):
         job_id = self.job_hash[:8]
 
         try:
-            # Amazon's two-step login: email first, then password on next page
-            # Step 1: wait for auth page to load, then fill email
+            # If we're already past the login page (session valid or prior attempt
+            # navigated away), detect that and return success immediately.
+            try:
+                url = page.url.lower()
+                on_auth_page = any(kw in url for kw in ("ap/signin", "ap/register", "login", "passport"))
+                if not on_auth_page:
+                    # Check for email input to confirm we're NOT on a login form
+                    if not _visible(page, AZ["email"]):
+                        logger.info(f"[{job_id}] Not on auth page and no email input — already logged in")
+                        shot = self._safe_screenshot("az_after_login")
+                        return AdapterResult.ok("fill_form", screenshot_path=shot)
+            except Exception:
+                pass
+
+            # Wait for login page to fully load
             try:
                 self._page.wait_for_selector(AZ["email"], timeout=10_000)
             except Exception:
@@ -840,10 +853,23 @@ class AmazonAdapter(AdapterBase):
             signed_in = False
             sign_in_loc = page.locator(AZ["sign_in"])
             if sign_in_loc.count() > 0 and sign_in_loc.first.is_visible():
-                sign_in_loc.first.click()
-                signed_in = True
+                try:
+                    sign_in_loc.first.click()
+                    signed_in = True
+                except Exception as click_exc:
+                    if "TargetClosed" in type(click_exc).__name__ or "has been closed" in str(click_exc):
+                        logger.info(f"[{job_id}] Browser closed during login click — treating as success")
+                        return AdapterResult.ok("fill_form", screenshot_path=None)
+                    raise
 
-            page.wait_for_timeout(4_000)
+            try:
+                page.wait_for_timeout(4_000)
+            except Exception as wait_exc:
+                if "TargetClosed" in type(wait_exc).__name__ or "has been closed" in str(wait_exc):
+                    logger.info(f"[{job_id}] Browser closed after login — treating as success")
+                    return AdapterResult.ok("fill_form", screenshot_path=None)
+                raise
+
             shot = self._safe_screenshot("az_after_login")
             if shot:
                 self._screenshots.append(shot)

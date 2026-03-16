@@ -9,12 +9,14 @@ The project already has a complete 9-state orchestrator FSM, 5 working adapters 
 
 ## Developer Split
 
-| Branch | Owner | Goal |
-|--------|-------|------|
-| `adapters-il` | Dev A (you) | Israeli market: LinkedIn Easy Apply + Comeet |
-| `adapters-global` | Dev B (friend) | Global ATS: SmartRecruiters + Security hardening |
+| Branch | Owner | Verify existing | Build new |
+|--------|-------|-----------------|-----------|
+| `adapters-il` | Dev A (you) | WorkdayAdapter + GenericAdapter | LinkedIn Easy Apply + Comeet |
+| `adapters-global` | Dev B (friend) | GreenhouseAdapter + LeverAdapter | SmartRecruiters + Security hardening |
 
 Only shared files: `core/adapters/__init__.py` (each adds 1 import line) and `webhook.py` (each touches a different function). No conflicts.
+
+> **Rule**: Before writing any new code, each dev must run the verification checklist for their assigned existing adapters and fix any bugs found. Only proceed to building new adapters once all verification steps pass.
 
 ---
 
@@ -30,6 +32,72 @@ Only shared files: `core/adapters/__init__.py` (each adds 1 import line) and `we
 ---
 
 ## Branch A: `adapters-il`
+
+### Step A0 — Verify existing adapters: WorkdayAdapter + GenericAdapter
+
+Complete all checks below before writing any new code. Log failures as issues on the branch.
+
+---
+
+#### A0.1 — WorkdayAdapter (`core/adapters/workday_adapter.py`)
+
+**Detection tests (no browser needed):**
+```python
+from core.adapters.workday_adapter import WorkdayAdapter
+
+assert WorkdayAdapter.detect("https://company.wd1.myworkdayjobs.com/en-US/External/job/123")
+assert WorkdayAdapter.detect("https://company.wd3.myworkdayjobs.com/careers/job/456")
+assert WorkdayAdapter.detect("https://wd1.myworkdayjobs.com/company/job/789")
+assert not WorkdayAdapter.detect("https://greenhouse.io/company/job/123")
+assert "workday" in __import__("core.orchestrator", fromlist=["_ADAPTER_REGISTRY"])._ADAPTER_REGISTRY
+```
+
+**Dry-run checklist** (`auto_submit=False`, real Workday URL):
+- [ ] `plan()` navigates to URL and returns `FILL_FORM` (not `LOGIN`) when session cookie exists
+- [ ] `plan()` returns `LOGIN` when no session — then `login()` runs, session saved to `data/workday_<tenant>_session.json`
+- [ ] `fill_form()` fills `data-automation-id="legalNameSection_firstName"` correctly (check screenshot)
+- [ ] `fill_form()` fills `data-automation-id="legalNameSection_lastName"` correctly
+- [ ] `fill_form()` fills `data-automation-id="phone-number"` correctly
+- [ ] Multi-step navigation: `bottom-navigation-next-btn` clicked for each page, no infinite loop
+- [ ] Resume uploaded (`input[data-automation-id="file-upload-block"]` or equivalent)
+- [ ] Stops before submit when `auto_submit=False` — screenshot saved as `wd_pre_submit_<hash>.png`
+- [ ] CAPTCHA detected → `request_human_intervention()` called, WhatsApp message arrives
+- [ ] `cleanup()` closes browser — no dangling Playwright processes
+
+**Known edge cases to test:**
+- [ ] Workday "Save and Continue" button (`bottom-navigation-save-continue-btn`) appears on some tenants — verify it is clicked instead of Next
+- [ ] Country/dropdown fields (`select[data-automation-id*="country"]`) — verify a value is selected, not left blank
+
+---
+
+#### A0.2 — GenericAdapter (`core/adapters/generic_adapter.py`)
+
+**Detection tests:**
+```python
+from core.adapters.generic_adapter import GenericAdapter
+from core.orchestrator import _ADAPTER_REGISTRY
+
+# Generic must NOT detect URLs handled by specific adapters
+assert not GenericAdapter.detect("https://greenhouse.io/job/123")  # only if detect() is defined
+# Generic is the catch-all — registered last, matched when no other adapter fires
+assert _ADAPTER_REGISTRY.get("generic") is not None or \
+       _ADAPTER_REGISTRY.get("*") is not None  # adjust to actual key used
+```
+
+**DOM-first + Vision-fallback dry-run** (use any job URL with no dedicated adapter):
+- [ ] `plan()` opens browser, navigates, returns a valid `ApplyState` (not exception)
+- [ ] `_dom_detect_page_state()` correctly classifies the page as `form`, `apply_button`, or `login`
+- [ ] `fill_form()` fills at least email field via DOM selectors before falling back to Vision
+- [ ] `_vision_identify_fields()` is called only when DOM detection returns 0 known fields
+- [ ] Vision call result is applied: fields returned by Groq are filled if selectors are valid
+- [ ] Screenshot saved after each step (`generic_form_start_<hash>.png`, etc.)
+- [ ] `auto_submit=False` stops before clicking submit — screenshot shows filled form
+
+**Fallback integration:**
+- [ ] When no other adapter matches a URL, `GenericAdapter` is selected by orchestrator (confirm by checking log: `"Using adapter: generic"`)
+- [ ] A URL handled by `GreenhouseAdapter` does NOT fall back to `GenericAdapter`
+
+---
 
 **Files to create/modify:**
 - `core/adapters/linkedin_adapter.py` — NEW
@@ -163,17 +231,94 @@ from core.adapters import comeet_adapter    as _comeet    # noqa: F401
 
 ---
 
-### Branch A Verification
-1. `assert LinkedInAdapter.detect("https://www.linkedin.com/jobs/view/123")`
-2. `assert ComeetAdapter.detect("https://careers.comeet.co/jobs/wix/123")`
-3. Verify both appear in `_ADAPTER_REGISTRY`
-4. Dry-run (`auto_submit=False`) on a known LinkedIn Easy Apply URL → reaches `FILL_FORM`, screenshots saved
-5. Dry-run on a Comeet URL → form fields detected
-6. Force HUMAN_INTERVENTION state → WhatsApp message arrives → send DONE → checkpoint resumes without state being wiped
+### Branch A — Done Criteria
+
+**Phase 1: Existing adapters verified** (Step A0 complete)
+- [ ] All WorkdayAdapter checklist items pass
+- [ ] All GenericAdapter checklist items pass
+- [ ] Any bugs found are fixed and committed on this branch
+
+**Phase 2: New adapters built and verified** (Steps A1–A4 complete)
+- [ ] `assert LinkedInAdapter.detect("https://www.linkedin.com/jobs/view/123")`
+- [ ] `assert ComeetAdapter.detect("https://careers.comeet.co/jobs/wix/123")`
+- [ ] Both appear in `_ADAPTER_REGISTRY`
+- [ ] Dry-run on LinkedIn Easy Apply URL → reaches `FILL_FORM`, screenshots saved in `data/screenshots/`
+- [ ] Dry-run on Comeet URL → all visible form fields filled, screenshot shows pre-submit state
+- [ ] HUMAN_INTERVENTION state fix: force intervention → WhatsApp message arrives → send DONE → state not wiped, checkpoint resumes
 
 ---
 
 ## Branch B: `adapters-global`
+
+### Step B0 — Verify existing adapters: GreenhouseAdapter + LeverAdapter
+
+Complete all checks below before writing any new code. Log failures as issues on the branch.
+
+---
+
+#### B0.1 — GreenhouseAdapter (`core/adapters/greenhouse_adapter.py`)
+
+**Detection tests (no browser needed):**
+```python
+from core.adapters.greenhouse_adapter import GreenhouseAdapter
+
+assert GreenhouseAdapter.detect("https://boards.greenhouse.io/company/jobs/123")
+assert GreenhouseAdapter.detect("https://grnh.se/abc123def")   # Greenhouse short-links
+assert not GreenhouseAdapter.detect("https://jobs.lever.co/company/123")
+assert not GreenhouseAdapter.detect("https://company.wd1.myworkdayjobs.com/job/123")
+```
+
+**Dry-run checklist** (`auto_submit=False`, real Greenhouse URL):
+- [ ] `plan()` navigates to a `boards.greenhouse.io` URL and returns `FILL_FORM` (no login needed)
+- [ ] `fill_form()` fills `#first_name`, `#last_name`, `#email`, `#phone` (verify via screenshot)
+- [ ] Resume uploaded via `#resume` or `input[name='resume']`
+- [ ] Cover letter filled if `#cover_letter` is visible
+- [ ] LinkedIn URL filled if `input[id*='linkedin' i]` is present
+- [ ] Custom questions loop (`li.custom-field`): for each question block, label extracted + answer looked up + field filled
+- [ ] `_check_consent_checkboxes(page, 1)` runs without error
+- [ ] CAPTCHA detected → `request_human_intervention()` called, WhatsApp message arrives
+- [ ] Stops before submit when `auto_submit=False` — screenshot `gh_pre_submit_<hash>.png` saved
+- [ ] `_detect_greenhouse_success()` returns True when confirmation div `#application-confirmation` is present (can simulate by loading the confirmation URL directly)
+
+**Edge cases:**
+- [ ] `grnh.se` short-link: verify the redirect is followed and `GreenhouseAdapter` is still selected (not `GenericAdapter`)
+- [ ] Custom question with `<select>`: `_select_option()` picks the best-matching option, not blank
+- [ ] Custom question with radio buttons: `_handle_radio_group()` selects the matching option
+
+---
+
+#### B0.2 — LeverAdapter (`core/adapters/lever_adapter.py`)
+
+**Detection tests (no browser needed):**
+```python
+from core.adapters.lever_adapter import LeverAdapter
+
+assert LeverAdapter.detect("https://jobs.lever.co/company/abc123-uuid")
+assert LeverAdapter.detect("https://lever.co/company/jobs/abc123")
+assert not LeverAdapter.detect("https://boards.greenhouse.io/company/jobs/123")
+assert not LeverAdapter.detect("https://smartrecruiters.com/company/job/123")
+```
+
+**Dry-run checklist** (`auto_submit=False`, real Lever URL):
+- [ ] `plan()` navigates to `jobs.lever.co` URL and returns `FILL_FORM`
+- [ ] If on job listing page (not form), `_click_lever_apply_button()` clicks Apply and transitions to form
+- [ ] `fill_form()` fills `input[name="name"]` with full name (first + last joined)
+- [ ] `fill_form()` fills `input[name="email"]` and `input[name="phone"]`
+- [ ] Resume uploaded via `input[name="resume"]` or `input[type="file"][id*="resume" i]`
+- [ ] Cover letter filled in `textarea[name="comments"]` if visible
+- [ ] Social links filled: `input[name="urls[LinkedIn]"]`, `input[name="urls[GitHub]"]` (if visible)
+- [ ] Custom questions loop (`div.application-question`): core fields are skipped, remaining questions answered
+- [ ] `_check_consent_checkboxes(page, 1)` runs without error
+- [ ] CAPTCHA detected → `request_human_intervention()` called, WhatsApp message arrives
+- [ ] Stops before submit when `auto_submit=False` — screenshot `lv_pre_submit_<hash>.png` saved
+- [ ] `_detect_lever_success()` returns True for `div.thanks` or body text "thanks for applying"
+
+**Edge cases:**
+- [ ] Lever "Apply for this job" button text vs. "Apply Now" — `_click_lever_apply_button()` handles both
+- [ ] Custom question whose container also holds `input[name="email"]` is skipped (dedup check in `_fill_lever_custom_questions`)
+- [ ] Social link fields not present on some jobs: code does not raise, just skips
+
+---
 
 **Files to create/modify:**
 - `core/adapters/smartrecruiters_adapter.py` — NEW
@@ -311,13 +456,20 @@ GMAIL_APP_PASSWORD=
 
 ---
 
-### Branch B Verification
-1. `assert SmartRecruitersAdapter.detect("https://jobs.smartrecruiters.com/Amdocs/123")`
-2. CORS: API response header should show `localhost:3000`, not `*`
-3. API without `API_KEY` + `DEV_MODE=false` → 500
-4. API with wrong key → 401; correct key → 200
-5. POST to `/webhook` with bad Twilio signature → 403
-6. SmartRecruiters dry-run: reaches `submit` state, screenshots saved
+### Branch B — Done Criteria
+
+**Phase 1: Existing adapters verified** (Step B0 complete)
+- [ ] All GreenhouseAdapter checklist items pass
+- [ ] All LeverAdapter checklist items pass
+- [ ] Any bugs found are fixed and committed on this branch
+
+**Phase 2: New adapter + security built and verified** (Steps B1–B5 complete)
+- [ ] `assert SmartRecruitersAdapter.detect("https://jobs.smartrecruiters.com/Amdocs/123")`
+- [ ] SmartRecruiters dry-run: all `[data-qa]` fields filled, reaches `submit` state, screenshots saved
+- [ ] CORS: API response header shows `localhost:3000`, not `*`
+- [ ] API without `API_KEY` + `DEV_MODE=false` → 500 error
+- [ ] API with wrong key → 401; correct key → 200
+- [ ] POST to `/webhook` with bad Twilio signature → 403
 
 ---
 
