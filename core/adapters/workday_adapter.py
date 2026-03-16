@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -117,6 +118,7 @@ WD: dict[str, str] = {
     "first_name":   'input[data-automation-id="legalNameSection_firstName"]',
     "last_name":    'input[data-automation-id="legalNameSection_lastName"]',
     "phone":        'input[data-automation-id="phone-number"]',
+    "phone_alt":    'input[data-automation-id="phoneNumber"]',
     "address_1":    'input[data-automation-id="addressSection_addressLine1"]',
     "city":         'input[data-automation-id="addressSection_city"]',
     "postal_code":  'input[data-automation-id="addressSection_postalCode"]',
@@ -945,7 +947,14 @@ class WorkdayAdapter(AdapterBase):
 
         for page_num in range(1, _MAX_FORM_PAGES + 1):
             logger.info(f"[{job_id}] Workday form page {page_num}")
-            page.wait_for_timeout(1_500)
+            try:
+                page.wait_for_timeout(1_500)
+            except Exception:
+                # Page was closed/navigated — likely submitted successfully
+                logger.info(f"[{job_id}] Page closed at page {page_num} — treating as submit")
+                return AdapterResult.ok("submit",
+                                        metadata={"pages_filled": page_num - 1,
+                                                  "submitted": True})
 
             # Terminal state checks
             if _visible(page, WD["success_page"]):
@@ -973,6 +982,15 @@ class WorkdayAdapter(AdapterBase):
                 "first_name", "last_name", "phone", "email",
                 "address", "city", "postal_code", "linkedin_url", "website",
                 "cover_letter",
+                # Binary yes/no radios — handled by _default_unfilled_binary_radios (Step 1+4)
+                # Prevent Vision from overriding with wrong "yes" answers
+                "previously_employed", "candidateispreviousworker",
+                "former_employee", "previous_employment",
+                # work_authorization: Vision misidentifies company-specific yes/no questions
+                # (e.g. "previously employed here?") as work_authorization → answers "Yes"
+                "work_authorization", "authorized_to_work", "legally_authorized",
+                # visa sponsorship — handled by _fill_wd_select_by_label → "No"
+                "visa_sponsorship_required", "require_sponsorship",
             }
             try:
                 field_data = _identify_fields(self._client, shot_path)
@@ -988,15 +1006,29 @@ class WorkdayAdapter(AdapterBase):
                     label = field.get("label", "")
                     if not candidate_key:
                         candidate_key = normalize_field_name(label)
-                    if candidate_key in known_candidate_keys:
+                    normalized_label = normalize_field_name(label)
+                    if candidate_key in known_candidate_keys or normalized_label in known_candidate_keys:
                         continue
-                    value = lookup_answer(candidate_key, answers, label, self._client)
+                    value = lookup_answer(label, candidate_key, field.get("type", "text"))
                     if value:
-                        _fill_field(page, field, value, answers, cv_path, 1)
+                        _fill_field(page, field, value, 1, self._cover_letter or "")
                 except Exception as exc:
                     logger.debug(f"[{job_id}] Vision field fill ({field.get('label')}): {exc}")
 
-            # ── Step 3: Consent checkboxes ──────────────────────────────────────────
+            # ── Step 3: Uncheck optional Workday toggles that open extra sections ──────
+            for opt_label in ("I have a preferred name",):
+                try:
+                    loc = page.get_by_label(opt_label, exact=False)
+                    if loc.count() > 0 and loc.first.is_visible() and loc.first.is_checked():
+                        loc.first.uncheck()
+                        page.wait_for_timeout(300)
+                        logger.debug(f"[{job_id}] Unchecked optional: {opt_label!r}")
+                except Exception:
+                    pass
+
+            # ── Step 4: Binary yes/no radio defaults + consent checkboxes ────────────
+            # force=True overrides any "Yes" that Vision may have incorrectly set
+            self._default_unfilled_binary_radios(page, job_id, force=True)
             _check_consent_checkboxes(page, 1)
             page.wait_for_timeout(500)
 
@@ -1004,7 +1036,14 @@ class WorkdayAdapter(AdapterBase):
             nav = self._click_workday_nav()
 
             if nav == "submit_clicked":
-                page.wait_for_timeout(4_000)
+                try:
+                    page.wait_for_timeout(4_000)
+                except Exception:
+                    # Page navigated away after submit — this is normal for successful submission
+                    logger.info(f"[{job_id}] Page closed after submit — treating as success")
+                    return AdapterResult.ok("submit",
+                                            metadata={"pages_filled": page_num,
+                                                      "submitted": True})
                 shot = self._safe_screenshot("after_wd_submit_nav")
                 if shot:
                     self._screenshots.append(shot)
@@ -1017,6 +1056,24 @@ class WorkdayAdapter(AdapterBase):
 
             if nav == "next_clicked":
                 page.wait_for_timeout(2_500)
+                # Check for validation errors and retry up to 3 times
+                for _retry in range(3):
+                    errors = self._get_validation_errors()
+                    if not errors:
+                        break
+                    shot_err = self._safe_screenshot(f"wd_err_{page_num:02d}_r{_retry}")
+                    if shot_err:
+                        self._screenshots.append(shot_err)
+                    filled = self._handle_validation_errors(errors, answers)
+                    if not filled:
+                        # Cannot fill missing fields — stop retrying
+                        logger.warning(f"[{job_id}] Could not fill validation error fields: {errors}")
+                        break
+                    page.wait_for_timeout(500)
+                    nav = self._click_workday_nav()
+                    page.wait_for_timeout(1_500)
+                    if nav not in ("next_clicked",):
+                        break
                 continue
 
             if nav == "no_button":
@@ -1033,6 +1090,88 @@ class WorkdayAdapter(AdapterBase):
             screenshot_path=shot,
         )
 
+    def _default_unfilled_binary_radios(self, page: "Page", job_id: str,
+                                          force: bool = False) -> None:
+        """For any required radio group that has only two options (Yes / No),
+        default to 'No' if no option is currently selected.
+
+        When ``force=True`` (called after Vision), also overrides any group
+        where 'Yes' is currently checked — Vision sometimes misidentifies
+        company-specific questions (e.g. "previously employed here?") and
+        clicks 'Yes'.  Forcing 'No' after Vision ensures those questions are
+        answered correctly.
+
+        This handles company-specific yes/no questions like
+        "Have you previously been employed here?" without needing them in
+        default_answers.yaml.
+        """
+        try:
+            # Find all visible radio inputs, group by name attribute
+            radios = page.locator('input[type="radio"]')
+            count = radios.count()
+            groups: dict[str, list] = {}
+            for i in range(count):
+                try:
+                    r = radios.nth(i)
+                    if not r.is_visible():
+                        continue
+                    name = r.get_attribute("name") or f"__unnamed_{i}"
+                    groups.setdefault(name, []).append(r)
+                except Exception:
+                    continue
+
+            for name, members in groups.items():
+                # Only process binary (2-option) groups
+                if len(members) != 2:
+                    continue
+
+                # Determine current state
+                checked_labels = []
+                for m in members:
+                    try:
+                        mid = m.get_attribute("id")
+                        lbl_text = ""
+                        if mid:
+                            lbl_el = page.locator(f'label[for="{mid}"]')
+                            if lbl_el.count() > 0:
+                                lbl_text = (lbl_el.first.inner_text() or "").strip().lower()
+                        val = (m.get_attribute("value") or "").lower()
+                        if m.is_checked():
+                            checked_labels.append(lbl_text or val)
+                    except Exception:
+                        continue
+
+                # Skip if already "No" (correct answer)
+                no_already = any("no" in lbl or lbl in ("no", "false") for lbl in checked_labels)
+                if no_already:
+                    continue
+
+                # Skip if something OTHER than yes/no is checked and force=False
+                yes_checked = any("yes" in lbl or lbl in ("yes", "true") for lbl in checked_labels)
+                nothing_checked = len(checked_labels) == 0
+                if not force and not nothing_checked:
+                    continue
+
+                # Find and click the "No" option
+                for m in members:
+                    try:
+                        lbl_text = ""
+                        mid = m.get_attribute("id")
+                        if mid:
+                            lbl_el = page.locator(f'label[for="{mid}"]')
+                            if lbl_el.count() > 0:
+                                lbl_text = (lbl_el.first.inner_text() or "").strip().lower()
+                        val = (m.get_attribute("value") or "").lower()
+                        if "no" in lbl_text or val == "no" or val == "false":
+                            m.check()
+                            action = "forced" if yes_checked else "defaulted"
+                            logger.debug(f"[{job_id}] Binary radio {action} → 'No' (name={name})")
+                            break
+                    except Exception:
+                        continue
+        except Exception as exc:
+            logger.debug(f"[{job_id}] _default_unfilled_binary_radios: {exc}")
+
     def _fill_known_workday_fields(self, answers: dict, cv_path: "Path") -> None:
         """Fill Workday fields identifiable by stable data-automation-id selectors.
 
@@ -1044,6 +1183,7 @@ class WorkdayAdapter(AdapterBase):
         direct_mappings: dict[str, str] = {
             WD["first_name"]:   answers.get("first_name", ""),
             WD["last_name"]:    answers.get("last_name", ""),
+            WD["email"]:        answers.get("email", ""),
             WD["phone"]:        answers.get("phone", ""),
             WD["address_1"]:    answers.get("address", ""),
             WD["city"]:         answers.get("city", ""),
@@ -1088,6 +1228,685 @@ class WorkdayAdapter(AdapterBase):
                 logger.info(f"[{self.job_hash[:8]}] CV uploaded to Workday")
             except Exception as exc:
                 logger.debug(f"CV upload: {exc}")
+
+        # Latin-script name fields (Workday international tenants use different automation-IDs)
+        for label_text, ans_key in [
+            ("Given Name(s) - Latin Script", "first_name"),
+            ("Family Name - Latin Script", "last_name"),
+        ]:
+            val = answers.get(ans_key, "")
+            if not val:
+                continue
+            try:
+                loc = page.get_by_label(label_text, exact=False)
+                if loc.count() > 0 and loc.first.is_visible():
+                    el = loc.first
+                    current = (el.input_value() or "").strip()
+                    if not current or (ans_key == "first_name" and " " in current):
+                        el.fill(val)
+                        page.wait_for_timeout(150)
+                        logger.debug(f"[{self.job_hash[:8]}] Filled {label_text!r} → {val!r}")
+            except Exception as exc:
+                logger.debug(f"Latin name ({label_text}): {exc}")
+
+        # Email — try multiple automation-IDs, then label fallback with tag check
+        email_val = answers.get("email", "")
+        if email_val:
+            _filled_email = False
+            for _esel in (
+                WD["email"],
+                'input[data-automation-id="emailAddress"]',
+                'input[data-automation-id="email-address"]',
+                'input[type="email"]',
+                'input[data-automation-id*="mail"]',
+            ):
+                if _visible(page, _esel):
+                    try:
+                        el = page.locator(_esel).first
+                        cur = ""
+                        try:
+                            cur = (el.input_value() or "").strip()
+                        except Exception:
+                            pass
+                        if not cur:
+                            el.fill(email_val)
+                            page.wait_for_timeout(150)
+                            logger.debug(f"[{self.job_hash[:8]}] Filled Email ({_esel})")
+                        _filled_email = True
+                        break
+                    except Exception as exc:
+                        logger.debug(f"Email fill ({_esel}): {exc}")
+            if not _filled_email:
+                # Label-based fallback — find any visible input labelled "Email"
+                for lbl_hint in ("Email Address", "Email"):
+                    try:
+                        loc = page.get_by_label(lbl_hint, exact=False)
+                        for _i in range(min(loc.count(), 3)):
+                            el = loc.nth(_i)
+                            if not el.is_visible():
+                                continue
+                            try:
+                                tag = el.evaluate("el => el.tagName.toLowerCase()")
+                            except Exception:
+                                continue
+                            if tag != "input":
+                                continue
+                            try:
+                                cur = (el.input_value() or "").strip()
+                            except Exception:
+                                cur = ""
+                            if not cur:
+                                el.fill(email_val)
+                                page.wait_for_timeout(150)
+                                logger.debug(f"[{self.job_hash[:8]}] Filled Email ({lbl_hint!r} label)")
+                            _filled_email = True
+                            break
+                        if _filled_email:
+                            break
+                    except Exception as exc:
+                        logger.debug(f"Email label fallback ({lbl_hint!r}): {exc}")
+
+        # Phone number fallback if direct automation-id not visible
+        phone_val = answers.get("phone", "")
+        if phone_val and not _visible(page, WD["phone"]):
+            # Try alternate automation-id first
+            if _visible(page, WD["phone_alt"]):
+                try:
+                    el = page.locator(WD["phone_alt"]).first
+                    if not (el.input_value() or "").strip():
+                        el.fill(phone_val)
+                        page.wait_for_timeout(150)
+                        logger.debug(f"[{self.job_hash[:8]}] Filled Phone Number (phoneNumber id)")
+                except Exception as exc:
+                    logger.debug(f"Phone phone_alt fill: {exc}")
+            else:
+                try:
+                    loc = page.get_by_label("Phone Number", exact=False)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        el = loc.first
+                        tag = el.evaluate("el => el.tagName.toLowerCase()")
+                        if tag == "input" and not (el.input_value() or "").strip():
+                            el.fill(phone_val)
+                            page.wait_for_timeout(150)
+                            logger.debug(f"[{self.job_hash[:8]}] Filled Phone Number (label fallback)")
+                except Exception as exc:
+                    logger.debug(f"Phone number fallback: {exc}")
+
+        # Workday combobox dropdowns — click-based approach (custom React components)
+        job_id = self.job_hash[:8]
+        self._fill_wd_select_by_label(page, "How Did You Hear About Us", "LinkedIn", job_id)
+        self._fill_wd_select_by_label(page, "Phone Device Type", "Mobile", job_id)
+        self._fill_wd_select_by_label(page, "Country", "Israel", job_id)
+        # Application Questions page comboboxes
+        self._fill_wd_select_by_label(page, "require visa sponsorship", "No", job_id)
+        self._fill_wd_select_by_label(page, "eligible to work in the country", "Yes", job_id)
+        self._fill_wd_select_by_label(page, "non-compete or non-solicitation", "No", job_id)
+
+        # Education section (My Experience page) — fill inline form
+        self._fill_workday_education(page, job_id, answers)
+
+        # Binary yes/no radios: default all unchecked groups to "No" BEFORE Vision runs.
+        # This prevents Vision from incorrectly clicking "Yes" on company-specific questions.
+        self._default_unfilled_binary_radios(page, job_id)
+
+    def _fill_workday_education(self, page: "Page", job_id: str, answers: dict) -> None:
+        """Fill the Education section on the My Experience page.
+
+        Workday shows Education as an inline form (no separate Save button).
+        Fields are saved automatically when Next is clicked.
+
+        Strategy: find "Education" as a leaf text node, then find the first "Add"
+        button that appears AFTER it in DOM order (and before Resume/CV section).
+        Guard: if School input is already visible, the form is already open — just fill.
+        """
+        try:
+            # Guard: if education fields already visible, just fill them (no Add needed)
+            school_inp = page.locator('input[data-automation-id*="school" i]').first
+            edu_already_open = school_inp.count() > 0 and school_inp.is_visible()
+
+            if not edu_already_open:
+                # Find Add button that comes AFTER "Education" heading AND BEFORE "Resume/CV"
+                add_btn_idx = page.evaluate("""() => {
+                    const allEls = Array.from(document.body.querySelectorAll('*'));
+                    const addBtns = allEls.filter(
+                        e => e.tagName === 'BUTTON' &&
+                             e.textContent.trim() === 'Add' &&
+                             e.getBoundingClientRect().width > 0
+                    );
+                    if (addBtns.length === 0) return -1;
+
+                    // Find the "Education" leaf text node (exact text, not containing other elements)
+                    let eduIdx = -1;
+                    for (let i = 0; i < allEls.length; i++) {
+                        const el = allEls[i];
+                        if (el.children.length === 0 &&
+                            el.textContent.trim() === 'Education' &&
+                            el.getBoundingClientRect().height > 0) {
+                            eduIdx = i;
+                            break;
+                        }
+                    }
+                    if (eduIdx < 0) return -1;
+
+                    // Find first Add button AFTER the Education node,
+                    // stopping if we hit a Resume/CV or Websites section
+                    for (let i = 0; i < addBtns.length; i++) {
+                        const btnIdx = allEls.indexOf(addBtns[i]);
+                        if (btnIdx <= eduIdx) continue;  // before Education
+                        // Verify nothing like "Resume/CV" is between Education and this button
+                        let blocked = false;
+                        for (let j = eduIdx + 1; j < btnIdx; j++) {
+                            const t = allEls[j].textContent.trim();
+                            if (t === 'Resume/CV' || t === 'Websites') {
+                                blocked = true; break;
+                            }
+                        }
+                        if (!blocked) return i;
+                    }
+                    return -1;
+                }""")
+
+                if add_btn_idx is None or add_btn_idx < 0:
+                    return
+
+                add_btns = page.locator('button').filter(has_text=re.compile(r'^Add$'))
+                if add_btn_idx >= add_btns.count():
+                    return
+                add_btn = add_btns.nth(add_btn_idx)
+                if not add_btn.is_visible():
+                    return
+
+                add_btn.click()
+                page.wait_for_timeout(1000)
+                logger.debug(f"[{job_id}] Education: clicked Add")
+
+            # Fill School Name (Workday autocomplete text input)
+            school = answers.get("university", "Bar Ilan University")
+            for sel in (
+                'input[data-automation-id*="school" i]',
+                'input[data-automation-id*="institution" i]',
+            ):
+                locs = page.locator(sel)
+                if locs.count() > 0 and locs.first.is_visible():
+                    cur = (locs.first.input_value() or "").strip()
+                    if not cur:
+                        locs.first.fill(school)
+                        page.wait_for_timeout(600)
+                        opt = page.locator('[data-automation-id="promptOption"]').first
+                        if opt.is_visible():
+                            opt.click()
+                            page.wait_for_timeout(400)
+                        logger.debug(f"[{job_id}] Education: filled school")
+                    break
+
+            # Fill Degree — use "Bachelor" as keyword (Workday uses "Bachelor of Science" etc.)
+            self._fill_wd_select_by_label(page, "Degree", "Bachelor", job_id)
+
+            # Fill Field of Study / Major
+            field = answers.get("field_of_study", "Software Engineering")
+            for lbl in ("Field of Study", "Major", "Concentration"):
+                try:
+                    inp = page.get_by_label(lbl, exact=False).first
+                    if inp.is_visible():
+                        tag = inp.evaluate("el => el.tagName.toLowerCase()")
+                        if tag == "input":
+                            cur = (inp.input_value() or "").strip()
+                            if not cur:
+                                inp.fill(field)
+                                page.wait_for_timeout(300)
+                            break
+                except Exception:
+                    pass
+
+            # No Save button — inline form is saved when Next is clicked
+            logger.debug(f"[{job_id}] Education: fields filled (inline, saved on Next)")
+        except Exception as exc:
+            logger.debug(f"[{job_id}] Education fill: {exc}")
+
+    def _fill_wd_select_by_label(self, page: "Page", label_hint: str,
+                                  preferred: str, job_id: str) -> bool:
+        """Fill a Workday combobox/dropdown by clicking it open and selecting an option.
+
+        Workday renders dropdowns as custom React combobox components, NOT native
+        <select> elements.  The correct approach:
+          1. Click the combobox trigger to open the dropdown
+          2. Wait for [data-automation-id="promptOption"] items to appear
+          3. Click the matching option
+
+        Tries multiple strategies to locate the trigger element.
+        """
+        def _pick_option(pref: str) -> bool:
+            """After the dropdown is open, click the best matching option.
+
+            Only considers VISIBLE options — Workday pre-loads options in the DOM
+            (hidden) so count() > 0 even when the dropdown is closed.
+            """
+            # Wait up to 2s for at least one visible promptOption to appear
+            try:
+                page.wait_for_selector(
+                    '[data-automation-id="promptOption"]',
+                    state="visible", timeout=2000,
+                )
+            except Exception:
+                pass  # Fallback to role-based selectors below
+
+            for opt_sel in (
+                '[data-automation-id="promptOption"]',
+                '[role="option"]',
+                '[role="listitem"]',
+            ):
+                opts = page.locator(opt_sel)
+                count = opts.count()
+                if count == 0:
+                    continue
+                # First pass: startswith match — prevents "No" from matching "Yes...non-compete..."
+                for i in range(count):
+                    try:
+                        opt = opts.nth(i)
+                        if not opt.is_visible():
+                            continue
+                        t = (opt.inner_text() or "").strip()
+                        if t.lower().startswith(pref.lower()):
+                            opt.click()
+                            page.wait_for_timeout(400)
+                            return True
+                    except Exception:
+                        continue
+                # Second pass: substring match
+                for i in range(count):
+                    try:
+                        opt = opts.nth(i)
+                        if not opt.is_visible():
+                            continue
+                        if pref.lower() in (opt.inner_text() or "").lower():
+                            opt.click()
+                            page.wait_for_timeout(400)
+                            return True
+                    except Exception:
+                        continue
+                # Fallback: first visible non-placeholder
+                for i in range(count):
+                    try:
+                        opt = opts.nth(i)
+                        if not opt.is_visible():
+                            continue
+                        t = (opt.inner_text() or "").strip().lower()
+                        if t and not t.startswith("select") and t != "--":
+                            opt.click()
+                            page.wait_for_timeout(400)
+                            return True
+                    except Exception:
+                        continue
+            return False
+
+        hint_lower = label_hint.lower()
+
+        def _try_trigger(trigger) -> bool:
+            """Click trigger, wait for visible options, click best match, verify."""
+            try:
+                # Check if already showing preferred value
+                try:
+                    cur = (trigger.inner_text() or "").strip()
+                    if preferred.lower() in cur.lower() and "select" not in cur.lower():
+                        logger.debug(f"[{job_id}] {label_hint!r} already = {preferred!r}")
+                        return True
+                except Exception:
+                    pass
+
+                trigger.scroll_into_view_if_needed()
+                trigger.click()
+                page.wait_for_timeout(700)
+
+                if _pick_option(preferred):
+                    # Verify the trigger now shows the selected value
+                    page.wait_for_timeout(300)
+                    try:
+                        new_text = (trigger.inner_text() or "").strip()
+                        if preferred.lower() in new_text.lower():
+                            logger.info(f"[{job_id}] WD combobox {label_hint!r} → {preferred!r}")
+                            return True
+                        # Selection reverted — try keyboard approach
+                        logger.debug(f"[{job_id}] {label_hint!r} click reverted ({new_text!r}), trying keyboard")
+                    except Exception:
+                        logger.info(f"[{job_id}] WD combobox {label_hint!r} → {preferred!r}")
+                        return True
+
+                # Keyboard fallback: close any open dropdown, reopen, type to filter
+                try:
+                    page.keyboard.press("Escape")   # close if open (toggle-safe)
+                    page.wait_for_timeout(200)
+                    trigger.scroll_into_view_if_needed()
+                    trigger.click()
+                    page.wait_for_timeout(600)
+                    page.keyboard.type(preferred[:4], delay=60)
+                    page.wait_for_timeout(700)
+                    opt = page.locator('[data-automation-id="promptOption"]').first
+                    if opt.is_visible():
+                        opt.click()
+                        page.wait_for_timeout(400)
+                        try:
+                            new_text = (trigger.inner_text() or "").strip()
+                            if preferred.lower() in new_text.lower():
+                                logger.info(f"[{job_id}] WD combobox {label_hint!r} → {preferred!r} (kbd)")
+                                return True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+            except Exception as exc:
+                logger.debug(f"[{job_id}] _try_trigger({label_hint!r}): {exc}")
+            return False
+
+        # Strategy 1: formField container → native <select> or comboboxButton inside
+        # Workday wraps each field in a [data-automation-id^="formField"] section.
+        # Application Questions may use native <select> elements (not comboboxButton).
+        try:
+            # 1a: strict label filter (My Information page)
+            containers = page.locator('[data-automation-id^="formField"]').filter(
+                has=page.locator(f'label:has-text("{label_hint}")')
+            )
+            cnt = containers.count()
+            # 1b: text-content filter (Application Questions & other pages without <label>)
+            if cnt == 0:
+                containers = page.locator('[data-automation-id^="formField"]').filter(
+                    has_text=label_hint
+                )
+                cnt = containers.count()
+            logger.debug(f"[{job_id}] WD S1 {label_hint!r}: {cnt} containers")
+            if cnt > 0:
+                c = containers.first
+                # 1c: try native <select> first (Application Questions page)
+                sel_el = c.locator('select')
+                if sel_el.count() > 0 and sel_el.first.is_visible():
+                    try:
+                        sel_el.first.select_option(label=preferred)
+                        page.wait_for_timeout(300)
+                        logger.debug(f"[{job_id}] WD S1 native select → {preferred!r}")
+                        return True
+                    except Exception:
+                        try:
+                            sel_el.first.select_option(value=preferred.lower())
+                            page.wait_for_timeout(300)
+                            logger.debug(f"[{job_id}] WD S1 native select (value) → {preferred!r}")
+                            return True
+                        except Exception as exc2:
+                            logger.debug(f"[{job_id}] WD S1 native select failed: {exc2}")
+                # 1d: try comboboxButton (My Information page custom comboboxes)
+                combo_btn = c.locator('[data-automation-id="comboboxButton"]')
+                btn = combo_btn.first if combo_btn.count() > 0 else c.locator('button').first
+                vis = btn.is_visible()
+                logger.debug(f"[{job_id}] WD S1 btn visible={vis}")
+                if vis:
+                    if _try_trigger(btn):
+                        return True
+        except Exception as exc:
+            logger.debug(f"[{job_id}] WD combobox container ({label_hint!r}): {exc}")
+
+        # Strategy 2: get_by_label → click element directly
+        try:
+            loc = page.get_by_label(label_hint, exact=False)
+            lcnt = loc.count()
+            logger.debug(f"[{job_id}] WD S2 {label_hint!r}: {lcnt} by-label")
+            for i in range(min(lcnt, 3)):
+                el = loc.nth(i)
+                if not el.is_visible():
+                    continue
+                if _try_trigger(el):
+                    return True
+        except Exception as exc:
+            logger.debug(f"[{job_id}] WD combobox label ({label_hint!r}): {exc}")
+
+        # Strategy 3: JS — find comboboxButton near ANY text element containing hint
+        # Handles Application Questions which use <div>/<p> instead of <label>
+        try:
+            idx = page.evaluate(
+                """(hint) => {
+                    hint = hint.toLowerCase();
+                    // Search label, then any visible text-bearing element
+                    const selectors = ['label', 'p', 'div[class*="label" i]',
+                                       'div[data-automation-id*="label" i]', 'span'];
+                    for (const sel of selectors) {
+                        for (const lbl of document.querySelectorAll(sel)) {
+                            if (!lbl.textContent.toLowerCase().includes(hint)) continue;
+                            if (lbl.getBoundingClientRect().height === 0) continue;
+                            let el = lbl.parentElement;
+                            for (let i = 0; i < 8; i++) {
+                                if (!el) break;
+                                // Prefer comboboxButton
+                                const combo = el.querySelector('[data-automation-id="comboboxButton"]');
+                                if (combo && combo.getBoundingClientRect().width > 0) {
+                                    const all = Array.from(document.querySelectorAll('[data-automation-id="comboboxButton"]'));
+                                    return all.indexOf(combo);
+                                }
+                                const btn = el.querySelector('button');
+                                if (btn && btn.getBoundingClientRect().width > 0) {
+                                    const allBtns = Array.from(document.querySelectorAll('[data-automation-id="comboboxButton"]'));
+                                    const cb = el.querySelector('[data-automation-id="comboboxButton"]');
+                                    if (cb) return allBtns.indexOf(cb);
+                                }
+                                el = el.parentElement;
+                            }
+                        }
+                    }
+                    return -1;
+                }""",
+                hint_lower,
+            )
+            if idx is not None and idx >= 0:
+                btn = page.locator('[data-automation-id="comboboxButton"]').nth(idx)
+                if btn.is_visible():
+                    if _try_trigger(btn):
+                        return True
+        except Exception as exc:
+            logger.debug(f"[{job_id}] WD combobox JS ({label_hint!r}): {exc}")
+
+        # Strategy 4: JS — find native <select> near text matching hint
+        # Catches Application Questions dropdowns not inside formField containers
+        try:
+            idx4 = page.evaluate(
+                """(hint) => {
+                    hint = hint.toLowerCase();
+                    const allSelects = Array.from(document.querySelectorAll('select'));
+                    for (const sel of allSelects) {
+                        if (sel.getBoundingClientRect().width === 0) continue;
+                        let el = sel.parentElement;
+                        for (let i = 0; i < 10; i++) {
+                            if (!el) break;
+                            if (el.textContent.toLowerCase().includes(hint)) {
+                                return allSelects.indexOf(sel);
+                            }
+                            el = el.parentElement;
+                        }
+                    }
+                    return -1;
+                }""",
+                hint_lower,
+            )
+            if idx4 is not None and idx4 >= 0:
+                sel = page.locator('select').nth(idx4)
+                if sel.is_visible():
+                    try:
+                        sel.select_option(label=preferred)
+                        page.wait_for_timeout(300)
+                        logger.debug(f"[{job_id}] WD S4 native select → {preferred!r}")
+                        return True
+                    except Exception:
+                        try:
+                            sel.select_option(value=preferred.lower())
+                            page.wait_for_timeout(300)
+                            logger.debug(f"[{job_id}] WD S4 native select (value) → {preferred!r}")
+                            return True
+                        except Exception as exc4:
+                            logger.debug(f"[{job_id}] WD S4 native select failed: {exc4}")
+        except Exception as exc:
+            logger.debug(f"[{job_id}] WD native select JS ({label_hint!r}): {exc}")
+        return False
+
+    def _get_validation_errors(self) -> list[str]:
+        """Return error messages from the Workday validation error banner.
+
+        Workday renders validation errors inside:
+          div[data-automation-id="wd-Errors"]
+
+        Each required-field error has a predictable format, e.g.:
+          "Given Name(s) - Latin Script is required"
+          "Phone Number is required"
+        """
+        page = self._page
+        errors: list[str] = []
+        try:
+            banner = page.locator(WD["error_banner"])
+            if banner.count() > 0 and banner.first.is_visible(timeout=1_000):
+                raw = (banner.first.inner_text() or "").strip()
+                for line in re.split(r"[\n•\-]+", raw):
+                    line = line.strip()
+                    if line:
+                        errors.append(line)
+        except Exception as exc:
+            logger.debug(f"[{self.job_hash[:8]}] _get_validation_errors: {exc}")
+        if errors:
+            logger.warning(f"[{self.job_hash[:8]}] Validation errors: {errors}")
+        return errors
+
+    def _handle_validation_errors(self, errors: list[str], answers: dict) -> bool:
+        """Fill fields identified in Workday validation error messages.
+
+        Parses human-readable error strings such as:
+          "Given Name(s) - Latin Script is required"
+          "Family Name - Latin Script is required"
+          "Email is required"
+          "Phone Number is required"
+
+        Returns True if at least one field was successfully filled.
+        """
+        page = self._page
+        job_id = self.job_hash[:8]
+        filled_any = False
+
+        for error in errors:
+            el_lower = error.lower()
+
+            # ── First / Given name ─────────────────────────────────────────────
+            if "given name" in el_lower or "first name" in el_lower:
+                val = answers.get("first_name", "")
+                if val:
+                    for sel in (
+                        WD["first_name"],
+                        'input[data-automation-id="legalNameSection_firstName"]',
+                    ):
+                        if _visible(page, sel):
+                            try:
+                                el = page.locator(sel).first
+                                if not (el.input_value() or "").strip():
+                                    el.fill(val)
+                                    page.wait_for_timeout(150)
+                                    filled_any = True
+                                    logger.info(f"[{job_id}] Error-recovery: filled first_name")
+                            except Exception:
+                                pass
+                    # Label fallback
+                    if not filled_any:
+                        for lbl in ("Given Name(s)", "Given Name(s) - Latin Script",
+                                    "First Name", "Given Names - Latin Script"):
+                            try:
+                                loc = page.get_by_label(lbl, exact=False)
+                                if loc.count() > 0 and loc.first.is_visible():
+                                    if not (loc.first.input_value() or "").strip():
+                                        loc.first.fill(val)
+                                        page.wait_for_timeout(150)
+                                        filled_any = True
+                                        break
+                            except Exception:
+                                pass
+
+            # ── Family / Last name ─────────────────────────────────────────────
+            elif "family name" in el_lower or "last name" in el_lower:
+                val = answers.get("last_name", "")
+                if val:
+                    for sel in (
+                        WD["last_name"],
+                        'input[data-automation-id="legalNameSection_lastName"]',
+                    ):
+                        if _visible(page, sel):
+                            try:
+                                el = page.locator(sel).first
+                                if not (el.input_value() or "").strip():
+                                    el.fill(val)
+                                    page.wait_for_timeout(150)
+                                    filled_any = True
+                                    logger.info(f"[{job_id}] Error-recovery: filled last_name")
+                            except Exception:
+                                pass
+                    if not filled_any:
+                        for lbl in ("Family Name", "Family Name - Latin Script", "Last Name"):
+                            try:
+                                loc = page.get_by_label(lbl, exact=False)
+                                if loc.count() > 0 and loc.first.is_visible():
+                                    if not (loc.first.input_value() or "").strip():
+                                        loc.first.fill(val)
+                                        page.wait_for_timeout(150)
+                                        filled_any = True
+                                        break
+                            except Exception:
+                                pass
+
+            # ── Email ──────────────────────────────────────────────────────────
+            elif "email" in el_lower:
+                val = answers.get("email", "")
+                if val:
+                    for sel in (
+                        WD["email"],
+                        'input[data-automation-id="emailAddress"]',
+                        'input[data-automation-id="email-address"]',
+                        'input[type="email"]',
+                    ):
+                        if _visible(page, sel):
+                            try:
+                                el = page.locator(sel).first
+                                if not (el.input_value() or "").strip():
+                                    el.fill(val)
+                                    page.wait_for_timeout(150)
+                                    filled_any = True
+                                    logger.info(f"[{job_id}] Error-recovery: filled email")
+                                    break
+                            except Exception:
+                                pass
+
+            # ── Phone ──────────────────────────────────────────────────────────
+            elif "phone" in el_lower:
+                val = answers.get("phone", "")
+                if val:
+                    for sel in (
+                        WD["phone"],
+                        WD["phone_alt"],
+                        'input[data-automation-id="phoneNumber"]',
+                    ):
+                        if _visible(page, sel):
+                            try:
+                                el = page.locator(sel).first
+                                if not (el.input_value() or "").strip():
+                                    el.fill(val)
+                                    page.wait_for_timeout(150)
+                                    filled_any = True
+                                    logger.info(f"[{job_id}] Error-recovery: filled phone")
+                                    break
+                            except Exception:
+                                pass
+                    if not filled_any:
+                        try:
+                            loc = page.get_by_label("Phone Number", exact=False)
+                            if loc.count() > 0 and loc.first.is_visible():
+                                if not (loc.first.input_value() or "").strip():
+                                    loc.first.fill(val)
+                                    page.wait_for_timeout(150)
+                                    filled_any = True
+                                    logger.info(f"[{job_id}] Error-recovery: filled phone (label)")
+                        except Exception:
+                            pass
+
+        return filled_any
 
     def _click_workday_nav(self) -> str:
         """Click the active Workday navigation button.

@@ -155,7 +155,9 @@ FIELD_NORMALIZATION = {
     "full name": "full_name", "name": "full_name", "your name": "full_name",
     "candidate name": "full_name",
     "first name": "first_name", "given name": "first_name", "forename": "first_name",
+    "given name(s) - latin script": "first_name", "given names - latin script": "first_name",
     "last name": "last_name", "surname": "last_name", "family name": "last_name",
+    "family name - latin script": "last_name",
 
     # Contact
     "email": "email", "email address": "email", "e-mail": "email",
