@@ -1055,7 +1055,11 @@ class WorkdayAdapter(AdapterBase):
                                         metadata={"pages_filled": page_num})
 
             if nav == "next_clicked":
-                page.wait_for_timeout(2_500)
+                try:
+                    page.wait_for_timeout(2_500)
+                except Exception:
+                    logger.info(f"[{job_id}] Page closed after next click — treating as navigation/submission")
+                    return AdapterResult.ok("submit", metadata={"pages_filled": page_num, "submitted": True})
                 # Check for validation errors and retry up to 3 times
                 for _retry in range(3):
                     errors = self._get_validation_errors()

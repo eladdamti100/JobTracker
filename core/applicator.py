@@ -31,7 +31,7 @@ from core.content_generator import ContentGenerator
 # ── Paths ────────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent.parent
 SCREENSHOTS_DIR = ROOT / "data" / "screenshots"
-CV_PATH = ROOT / "data" / "CV Resume.pdf"
+CV_PATH = ROOT / "data" / "Nimrod_Netzer_Resume.pdf"
 PROFILE_PATH = ROOT / "config" / "profile.yaml"
 ANSWERS_PATH = ROOT / "data" / "default_answers.yaml"
 
