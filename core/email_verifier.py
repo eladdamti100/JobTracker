@@ -4,13 +4,15 @@ Connects to Gmail via IMAP, searches for verification emails from job platforms,
 extracts the verification URL or code, and handles it automatically.
 """
 
+import html as _html
 import os
 import re
 import imaplib
 import email
 import time
 from email.header import decode_header
-from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone, timedelta
 
 import requests
 from loguru import logger
@@ -92,8 +94,6 @@ def _extract_links(msg) -> list[str]:
     Extracts from both href attributes (HTML) and bare URLs (plain text).
     HTML entity decoding is applied so &amp; → & doesn't break URLs.
     """
-    import html as _html
-
     def _from_body(body: str, is_html: bool) -> list[str]:
         found = []
         if is_html:
@@ -123,14 +123,7 @@ def _extract_links(msg) -> list[str]:
             links.extend(_from_body(body, is_html=(ctype == "text/html")))
         except Exception:
             pass
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    result = []
-    for lnk in links:
-        if lnk not in seen:
-            seen.add(lnk)
-            result.append(lnk)
-    return result
+    return list(dict.fromkeys(links))
 
 
 def _extract_verification_code(body_text: str) -> str | None:
@@ -206,7 +199,6 @@ def find_verification_email(platform_key: str = "generic",
             mail.select("INBOX")
 
             # Search last 2 days to handle UTC/local timezone edge cases
-            from datetime import timedelta
             since_dt = datetime.now(timezone.utc) - timedelta(days=1)
             since_str = since_dt.strftime("%d-%b-%Y")
             _, msg_ids = mail.search(None, f'(SINCE "{since_str}")')
@@ -221,7 +213,6 @@ def find_verification_email(platform_key: str = "generic",
                 raw_date = hdr[0][1].decode(errors="replace")
                 date_str = re.sub(r"Date:\s*", "", raw_date, flags=re.I).strip()
                 try:
-                    from email.utils import parsedate_to_datetime
                     msg_dt = parsedate_to_datetime(date_str)
                     if msg_dt.tzinfo is None:
                         msg_dt = msg_dt.replace(tzinfo=timezone.utc)
