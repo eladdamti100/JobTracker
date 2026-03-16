@@ -26,6 +26,8 @@ import yaml
 from loguru import logger
 from playwright.sync_api import sync_playwright, Page
 
+from core.content_generator import ContentGenerator
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent.parent
 SCREENSHOTS_DIR = ROOT / "data" / "screenshots"
@@ -341,13 +343,16 @@ def normalize_field_name(label: str) -> str:
 
 
 def lookup_answer(field_label: str, candidate_field: str = "",
-                  field_type: str = "text") -> str:
+                  field_type: str = "text",
+                  content_generator: "ContentGenerator | None" = None,
+                  options: list[str] | None = None) -> str:
     """Look up the answer for a field from the central answer database.
 
     Priority:
     1. candidate_field from Groq Vision (if it maps to an answer)
     2. Normalized field label
-    3. Smart defaults based on field type
+    3. AI-generated answer via ContentGenerator (for any unrecognized field)
+    4. Smart defaults based on field type
     """
     answers = _get_answers()
 
@@ -360,7 +365,17 @@ def lookup_answer(field_label: str, candidate_field: str = "",
     if normalized in answers:
         return str(answers[normalized])
 
-    # 3. Smart defaults based on field type
+    # 3. AI fallback: ask Groq to determine the value for this unknown field
+    if content_generator is not None:
+        generated = content_generator.generate(
+            field_label=field_label,
+            field_type=field_type,
+            options=options or [],
+        )
+        if generated:
+            return generated
+
+    # 4. Smart defaults based on field type (last resort)
     if field_type == "textarea":
         return str(answers.get("about_me", ""))
     if field_type == "select":
@@ -369,6 +384,223 @@ def lookup_answer(field_label: str, candidate_field: str = "",
         return ""  # Will be handled by radio logic
 
     return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DOM Option Extractors  (JS parsing via page.evaluate)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Placeholder values that should be excluded from extracted option lists
+_PLACEHOLDER_OPTION_TEXTS = {
+    "", "select", "select...", "select one", "select an option",
+    "choose", "choose...", "please select", "--", "---", "none",
+}
+
+
+def _extract_native_select_options(page: "Page", label: str) -> list[str]:
+    """Extract option texts from a native <select> element matching the label.
+
+    Uses JS to read all <option> values directly from the DOM — faster and
+    more reliable than Playwright's .all_text_contents() for large option lists.
+
+    Returns a list of option texts (excluding placeholders), or [] if not found.
+    """
+    normalized = normalize_field_name(label)
+    strategies = [
+        lambda: page.get_by_label(label, exact=False),
+        lambda: page.locator(f'select[name*="{normalized}" i]'),
+        lambda: page.locator(f'select[id*="{normalized}" i]'),
+        lambda: page.locator(f'select[aria-label*="{label}" i]'),
+    ]
+    select_el = None
+    for fn in strategies:
+        try:
+            loc = fn()
+            if loc.count() > 0 and loc.first.is_visible():
+                tag = loc.first.evaluate("el => el.tagName")
+                if tag == "SELECT":
+                    select_el = loc.first
+                    break
+        except Exception:
+            continue
+
+    if not select_el:
+        return []
+
+    try:
+        # Read all option texts in one JS call — avoids N round-trips
+        texts: list[str] = select_el.evaluate(
+            "el => Array.from(el.options).map(o => o.text.trim())"
+        )
+        return [t for t in texts if t.lower() not in _PLACEHOLDER_OPTION_TEXTS]
+    except Exception:
+        return []
+
+
+def _extract_combobox_options(page: "Page", label: str) -> list[str]:
+    """Extract options from a custom combobox/React dropdown.
+
+    Works for Workday, Greenhouse, and other SPAs that render dropdowns as
+    [role="combobox"] + [role="option"] or [data-automation-id="promptOption"].
+
+    Strategy:
+    1. Find the combobox trigger by label, aria-label, or nearby text
+    2. Click to open it
+    3. Read visible [role="option"] / promptOption items via JS
+    4. Press Escape to close without selecting
+
+    Returns a list of option texts, or [] if not found / already open.
+    """
+    normalized = normalize_field_name(label)
+    label_lower = label.lower()
+
+    # ── Find the combobox trigger ─────────────────────────────────────────
+    trigger = None
+    trigger_strategies = [
+        lambda: page.locator(f'[role="combobox"][aria-label*="{label}" i]'),
+        lambda: page.locator(f'[role="combobox"][id*="{normalized}" i]'),
+        lambda: page.get_by_label(label, exact=False).filter(
+            has=page.locator('[role="combobox"]')),
+        # Workday pattern: find combobox whose nearby label text matches
+        lambda: _find_combobox_near_label(page, label_lower),
+    ]
+    for fn in trigger_strategies:
+        try:
+            loc = fn()
+            if loc is not None and loc.count() > 0 and loc.first.is_visible():
+                trigger = loc.first
+                break
+        except Exception:
+            continue
+
+    if not trigger:
+        return []
+
+    try:
+        # Open the dropdown
+        trigger.scroll_into_view_if_needed()
+        trigger.click()
+        page.wait_for_timeout(600)
+
+        # Read options via JS in one round-trip
+        options: list[str] = page.evaluate("""() => {
+            const selectors = [
+                '[data-automation-id="promptOption"]',
+                '[role="option"]',
+                '[role="listitem"]',
+                'li[class*="option" i]',
+            ];
+            for (const sel of selectors) {
+                const els = Array.from(document.querySelectorAll(sel))
+                    .filter(el => el.offsetParent !== null);  // visible only
+                if (els.length > 0)
+                    return els.map(el => el.textContent.trim());
+            }
+            return [];
+        }""")
+
+        # Close dropdown without selecting
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+
+        return [t for t in options if t.lower() not in _PLACEHOLDER_OPTION_TEXTS]
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return []
+
+
+def _find_combobox_near_label(page: "Page", label_lower: str):
+    """Find a combobox whose nearest visible label text contains the hint.
+
+    Iterates all [role="combobox"] elements and checks if their associated
+    label (via aria-labelledby, for=, or parent text) matches label_lower.
+    Returns a Locator for the first match, or None.
+    """
+    try:
+        combos = page.locator('[role="combobox"]')
+        count = combos.count()
+        for i in range(min(count, 20)):
+            combo = combos.nth(i)
+            if not combo.is_visible():
+                continue
+            # Check aria-labelledby
+            labelledby = combo.get_attribute("aria-labelledby") or ""
+            if labelledby:
+                try:
+                    lbl_text = page.locator(f'#{labelledby}').first.inner_text().lower()
+                    if label_lower in lbl_text or lbl_text in label_lower:
+                        return combos.nth(i)
+                except Exception:
+                    pass
+            # Check parent container text
+            try:
+                parent_text = combo.locator("xpath=../..").inner_text().lower()
+                if label_lower in parent_text:
+                    return combos.nth(i)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _pick_best_option(
+    options: list[str],
+    value: str,
+    field_label: str,
+    field_type: str,
+    content_generator: "ContentGenerator | None",
+) -> str | None:
+    """Choose the best option from a list for the given field value.
+
+    Strategy:
+    1. Exact match (case-insensitive)
+    2. Substring match — value inside option or option inside value
+    3. ContentGenerator — ask Groq to pick from the list
+    4. First option (fallback)
+
+    Returns the exact option text to use, or None if options is empty.
+    """
+    if not options:
+        return None
+
+    value_lower = (value or "").lower().strip()
+
+    # 1. Exact match
+    for opt in options:
+        if opt.lower() == value_lower:
+            return opt
+
+    # 2. Substring match
+    if value_lower:
+        for opt in options:
+            if value_lower in opt.lower() or opt.lower() in value_lower:
+                return opt
+
+    # 3. Groq picks from the list
+    if content_generator is not None:
+        generated = content_generator.generate(
+            field_label=field_label,
+            field_type=field_type,
+            options=options,
+        )
+        if generated:
+            # Validate it's actually one of the options
+            gen_lower = generated.lower().strip()
+            for opt in options:
+                if opt.lower() == gen_lower or gen_lower in opt.lower():
+                    return opt
+            # If Groq returned something not in the list, log and fall through
+            logger.debug(
+                f"_pick_best_option: Groq returned {generated!r} not in options, "
+                f"falling back to first"
+            )
+
+    # 4. First option
+    return options[0]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -660,50 +892,50 @@ def _check_consent_checkboxes(page: Page, step_num: int) -> int:
     return step_num
 
 
-def _fill_dropdown(page: Page, field: dict, value: str, step_num: int) -> tuple[bool, int]:
-    """Handle select/dropdown fields.
+def _fill_dropdown(page: Page, field: dict, value: str, step_num: int,
+                   content_generator: "ContentGenerator | None" = None) -> tuple[bool, int]:
+    """Handle select/dropdown fields — both native <select> and custom comboboxes.
 
     Strategy:
-    1. Try to match option text with the answer value
-    2. If no match, select first non-empty option
+    1. Native <select>: extract options via JS, pick best match with _pick_best_option
+    2. Custom combobox ([role="combobox"]): open → extract visible options via JS →
+       pick best with _pick_best_option → click it
+    3. Fallback: first non-placeholder option
 
     Returns (filled, step_num).
     """
     label = field.get("label", "")
     filled = False
 
-    # Try to find the select element
+    # ── Path A: Native <select> ───────────────────────────────────────────────
     select_loc = None
-    strategies = [
+    normalized = normalize_field_name(label)
+    sel_strategies = [
         lambda: page.get_by_label(label, exact=False),
-        lambda: page.locator(f'select[name*="{normalize_field_name(label)}" i]'),
-        lambda: page.locator(f'select[id*="{normalize_field_name(label)}" i]'),
+        lambda: page.locator(f'select[name*="{normalized}" i]'),
+        lambda: page.locator(f'select[id*="{normalized}" i]'),
         lambda: page.locator(f'select[aria-label*="{label}" i]'),
     ]
-    for fn in strategies:
+    for fn in sel_strategies:
         try:
             loc = fn()
             if loc.count() > 0 and loc.first.is_visible():
-                tag = loc.first.evaluate("el => el.tagName")
-                if tag == "SELECT":
+                if loc.first.evaluate("el => el.tagName") == "SELECT":
                     select_loc = loc.first
                     break
         except Exception:
             continue
 
     if not select_loc:
-        # Try any visible select near a label
         try:
             selects = page.locator("select")
             for i in range(min(selects.count(), 10)):
                 sel = selects.nth(i)
                 if sel.is_visible():
-                    # Check if this select's label matches
                     try:
                         sel_id = sel.get_attribute("id") or ""
                         sel_name = sel.get_attribute("name") or ""
-                        if (normalize_field_name(label) in sel_id.lower() or
-                                normalize_field_name(label) in sel_name.lower()):
+                        if (normalized in sel_id.lower() or normalized in sel_name.lower()):
                             select_loc = sel
                             break
                     except Exception:
@@ -711,56 +943,98 @@ def _fill_dropdown(page: Page, field: dict, value: str, step_num: int) -> tuple[
         except Exception:
             pass
 
-    if not select_loc:
-        return False, step_num
-
-    try:
-        # Get all options
-        options = select_loc.locator("option").all_text_contents()
-        option_values = []
+    if select_loc:
         try:
-            count = select_loc.locator("option").count()
-            for i in range(count):
-                val = select_loc.locator("option").nth(i).get_attribute("value") or ""
-                option_values.append(val)
-        except Exception:
-            option_values = options
+            options = _extract_native_select_options(page, label)
+            if not options:
+                # Fallback read
+                options = [t for t in select_loc.locator("option").all_text_contents()
+                           if t.strip().lower() not in _PLACEHOLDER_OPTION_TEXTS]
 
-        # Strategy 1: Match answer value to option text (case-insensitive)
-        value_lower = value.lower() if value else ""
-        for idx, opt_text in enumerate(options):
-            if value_lower and value_lower in opt_text.lower():
-                if idx < len(option_values) and option_values[idx]:
-                    select_loc.select_option(value=option_values[idx])
-                else:
-                    select_loc.select_option(label=opt_text)
-                _step(step_num, f"Dropdown \"{label}\" -> \"{opt_text}\" done")
+            best = _pick_best_option(options, value, label, "select", content_generator)
+            if best:
+                try:
+                    select_loc.select_option(label=best)
+                except Exception:
+                    select_loc.select_option(value=best)
+                _step(step_num, f"Dropdown \"{label}\" -> \"{best}\" done")
                 filled = True
-                break
+        except Exception as e:
+            _step(step_num, f"Native select \"{label}\" failed: {e}")
+        return filled, step_num + 1
 
-        # Strategy 2: Select first non-empty, non-placeholder option
-        if not filled:
-            for idx, opt_text in enumerate(options):
-                stripped = opt_text.strip().lower()
-                if stripped and stripped not in ("", "select", "select...", "choose",
-                                                 "choose...", "--", "---", "please select",
-                                                 "select one", "select an option"):
-                    if idx < len(option_values) and option_values[idx]:
-                        select_loc.select_option(value=option_values[idx])
-                    else:
-                        select_loc.select_option(label=opt_text)
-                    _step(step_num, f"Dropdown \"{label}\" -> \"{opt_text}\" (first valid option)")
-                    filled = True
-                    break
+    # ── Path B: Custom combobox (React/Workday/SPA pattern) ──────────────────
+    options = _extract_combobox_options(page, label)
+    if options:
+        best = _pick_best_option(options, value, label, "select", content_generator)
+        if best:
+            # Re-open and click the chosen option
+            try:
+                trigger = _find_combobox_near_label(page, label.lower())
+                if trigger is None:
+                    # Try generic combobox locators
+                    for sel in (
+                        f'[role="combobox"][aria-label*="{label}" i]',
+                        f'[role="combobox"][id*="{normalized}" i]',
+                    ):
+                        loc = page.locator(sel)
+                        if loc.count() > 0 and loc.first.is_visible():
+                            trigger = loc.first
+                            break
 
-    except Exception as e:
-        _step(step_num, f"Dropdown \"{label}\" failed: {e}")
+                if trigger:
+                    trigger.scroll_into_view_if_needed()
+                    trigger.click()
+                    page.wait_for_timeout(600)
+
+                    # Click the matching option
+                    for opt_sel in (
+                        '[data-automation-id="promptOption"]',
+                        '[role="option"]',
+                        '[role="listitem"]',
+                    ):
+                        opts = page.locator(opt_sel)
+                        for i in range(min(opts.count(), 50)):
+                            try:
+                                opt = opts.nth(i)
+                                if not opt.is_visible():
+                                    continue
+                                t = (opt.inner_text() or "").strip()
+                                if t.lower() == best.lower() or best.lower() in t.lower():
+                                    opt.click()
+                                    page.wait_for_timeout(400)
+                                    _step(step_num, f"Combobox \"{label}\" -> \"{t}\" done")
+                                    filled = True
+                                    break
+                            except Exception:
+                                continue
+                        if filled:
+                            break
+
+                    if not filled:
+                        page.keyboard.press("Escape")
+                        page.wait_for_timeout(200)
+            except Exception as e:
+                _step(step_num, f"Combobox \"{label}\" click failed: {e}")
+                try:
+                    page.keyboard.press("Escape")
+                except Exception:
+                    pass
+
+    if not filled:
+        _step(step_num, f"Dropdown/combobox \"{label}\" — no matching element found")
 
     return filled, step_num + 1
 
 
-def _fill_radio(page: Page, field: dict, value: str, step_num: int) -> tuple[bool, int]:
+def _fill_radio(page: Page, field: dict, value: str, step_num: int,
+                content_generator: "ContentGenerator | None" = None) -> tuple[bool, int]:
     """Handle radio button groups (yes/no questions, multiple choice).
+
+    Strategy:
+    1. Collect all visible radio options from the DOM (label text + value attr)
+    2. Use _pick_best_option (with ContentGenerator) to choose the best match
+    3. Check the matching radio
 
     Returns (filled, step_num).
     """
@@ -773,49 +1047,65 @@ def _fill_radio(page: Page, field: dict, value: str, step_num: int) -> tuple[boo
     if not answer and normalized in YES_NO_KEYS:
         answer = answers.get(normalized, "Yes")
 
-    if not answer:
-        return False, step_num
-
-    answer_lower = answer.lower()
     filled = False
 
-    # Strategy 1: Find radio buttons by group name or nearby label
     try:
-        # Get all radio inputs
         radios = page.locator('input[type="radio"]')
         count = radios.count()
 
-        for i in range(min(count, 20)):
+        # ── Collect all radio options from the DOM ────────────────────────
+        radio_options: list[tuple[str, str]] = []  # (label_text, value_attr)
+        for i in range(min(count, 30)):
             radio = radios.nth(i)
             if not radio.is_visible():
                 continue
-
-            # Get the radio's label text
             radio_label = ""
             try:
                 radio_id = radio.get_attribute("id")
                 if radio_id:
-                    label_el = page.locator(f'label[for="{radio_id}"]')
-                    if label_el.count() > 0:
-                        radio_label = label_el.first.inner_text().strip().lower()
+                    lbl = page.locator(f'label[for="{radio_id}"]')
+                    if lbl.count() > 0:
+                        radio_label = lbl.first.inner_text().strip()
             except Exception:
                 pass
-
             if not radio_label:
                 try:
-                    radio_label = radio.locator("xpath=..").inner_text().strip().lower()
+                    radio_label = radio.locator("xpath=..").inner_text().strip()
                 except Exception:
                     pass
+            radio_val = radio.get_attribute("value") or ""
+            radio_options.append((radio_label, radio_val))
 
-            # Check if this radio's label matches the answer
-            radio_value = (radio.get_attribute("value") or "").lower()
+        # ── Pick the best option ──────────────────────────────────────────
+        option_texts = [lbl for lbl, _ in radio_options if lbl]
+        if not option_texts:
+            option_texts = [val for _, val in radio_options if val]
 
-            if (answer_lower in radio_label or answer_lower == radio_value or
-                    radio_label in answer_lower):
-                radio.check()
-                _step(step_num, f"Radio \"{label}\" -> \"{radio_label or radio_value}\" done")
-                filled = True
-                break
+        if answer:
+            best = _pick_best_option(
+                option_texts, answer, label, "radio", content_generator
+            )
+        elif content_generator and option_texts:
+            # No static answer — let Groq decide from the available options
+            best = content_generator.generate(
+                field_label=label, field_type="radio", options=option_texts
+            )
+        else:
+            best = None
+
+        if not best and option_texts:
+            best = option_texts[0]  # last resort: first option
+
+        # ── Check the matching radio ──────────────────────────────────────
+        if best:
+            best_lower = best.lower().strip()
+            for i, (rl, rv) in enumerate(radio_options):
+                if (best_lower in rl.lower() or rl.lower() in best_lower or
+                        best_lower == rv.lower()):
+                    radios.nth(i).check()
+                    _step(step_num, f"Radio \"{label}\" -> \"{rl or rv}\" done")
+                    filled = True
+                    break
 
     except Exception as e:
         _step(step_num, f"Radio \"{label}\" failed: {e}")
@@ -824,7 +1114,8 @@ def _fill_radio(page: Page, field: dict, value: str, step_num: int) -> tuple[boo
 
 
 def _fill_field(page: Page, field: dict, value: str, step_num: int,
-                cover_letter: str = "") -> tuple[bool, int]:
+                cover_letter: str = "",
+                content_generator: "ContentGenerator | None" = None) -> tuple[bool, int]:
     """Fill a single form field with robust fallback for required fields.
 
     Strategy order:
@@ -843,7 +1134,9 @@ def _fill_field(page: Page, field: dict, value: str, step_num: int,
 
     # ── Resolve value from answer database if not provided ────────────────
     if not value:
-        value = lookup_answer(label, candidate_field, field_type)
+        value = lookup_answer(label, candidate_field, field_type,
+                              content_generator=content_generator,
+                              options=field.get("options"))
 
     # Special: cover_letter always uses the generated one
     if candidate_field == "cover_letter" or normalized == "cover_letter":
@@ -890,14 +1183,16 @@ def _fill_field(page: Page, field: dict, value: str, step_num: int,
 
     # ── Radio buttons ─────────────────────────────────────────────────────
     if field_type == "radio":
-        filled, step_num = _fill_radio(page, field, value, step_num)
+        filled, step_num = _fill_radio(page, field, value, step_num,
+                                       content_generator=content_generator)
         if not filled and is_required:
             _step(step_num, f"FAILED: Required radio \"{label}\" not filled")
         return filled, step_num
 
     # ── Dropdown / select ─────────────────────────────────────────────────
     if field_type == "select":
-        filled, step_num = _fill_dropdown(page, field, value, step_num)
+        filled, step_num = _fill_dropdown(page, field, value, step_num,
+                                          content_generator=content_generator)
         if not filled and is_required:
             _step(step_num, f"FAILED: Required dropdown \"{label}\" not filled")
         return filled, step_num
@@ -1025,9 +1320,47 @@ def _fill_field(page: Page, field: dict, value: str, step_num: int,
             except Exception as e:
                 _step(step_num, f"Input fallback failed: {e}")
 
-    # ── Smart default for required fields with no value ───────────────────
+    # ── ContentGenerator retry for required fields that failed ───────────
+    # Triggered when: field is required, still not filled, and either:
+    #   a) The YAML value didn't work (value mismatch on dropdowns/combos), OR
+    #   b) The YAML had no answer (value was empty)
+    if not filled and is_required and content_generator is not None:
+        if field_type in ("select", "radio"):
+            # For dropdowns/radio: extract options and let Groq pick
+            opts = (field.get("options") or
+                    _extract_native_select_options(page, label) or
+                    _extract_combobox_options(page, label))
+            if opts:
+                _step(step_num, f"AI retry: picking from {len(opts)} options for \"{label}\"")
+                # Re-run the appropriate fill with a Groq-generated value
+                ai_value = _pick_best_option(opts, value, label, field_type, content_generator)
+                if ai_value:
+                    if field_type == "select":
+                        filled, step_num = _fill_dropdown(
+                            page, field, ai_value, step_num, content_generator=None
+                        )
+                    else:
+                        filled, step_num = _fill_radio(
+                            page, field, ai_value, step_num, content_generator=None
+                        )
+        elif field_type in ("text", "email", "tel", "url", "textarea"):
+            ai_value = content_generator.generate(
+                field_label=label, field_type=field_type,
+                options=field.get("options") or [],
+            )
+            if ai_value:
+                _step(step_num, f"AI retry: filling \"{label}\" -> \"{ai_value[:60]}\"")
+                try:
+                    loc = page.get_by_label(label, exact=False)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        loc.first.fill(ai_value)
+                        filled = True
+                        value = ai_value
+                except Exception:
+                    pass
+
+    # ── Smart default for required fields still not filled ────────────────
     if not filled and is_required and not value:
-        # Last resort: fill with "N/A" for text fields
         if field_type in ("text", "email", "tel", "url"):
             default = "N/A"
         elif field_type == "textarea":
@@ -1193,6 +1526,219 @@ def _find_navigation_button(page: Page, texts: list[str]) -> str | None:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Login / Signup / 2FA handling
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _vision_agent_pass(
+    page: "Page",
+    client: OpenAI,
+    content_generator: "ContentGenerator | None",
+    job_id: str,
+    step: int,
+    max_retries: int = 2,
+) -> int:
+    """Vision agent: screenshot the current form, ask Groq Vision what's still
+    unfilled or wrong, execute the suggested actions, then verify.
+
+    This is the last-resort layer — runs after all other fill strategies have
+    been attempted. Groq Vision sees exactly what a human would see and returns
+    a JSON list of actions to take.
+
+    Action format returned by Vision:
+        [
+          {
+            "field_label": "Degree",
+            "action": "select" | "fill" | "click" | "check",
+            "value": "Bachelor of Science",
+            "selector_hint": "optional CSS or aria hint"
+          }, ...
+        ]
+
+    Args:
+        max_retries: how many screenshot→act→verify cycles to run
+    Returns updated step number.
+    """
+    logger.info(f"[{job_id}] Vision agent pass starting (max_retries={max_retries})")
+
+    # Build candidate context summary for the prompt
+    try:
+        from core.content_generator import _get_candidate_data, _build_projects_block, _build_skills_block
+        data = _get_candidate_data()
+        general_ctx = (data.get("general_context") or "").strip().replace("\n", " ")
+        projects_summary = _build_projects_block(data)
+        skills_summary = _build_skills_block(data)
+    except Exception:
+        general_ctx = "Software Engineering student, Bar Ilan University, GPA 89+"
+        projects_summary = ""
+        skills_summary = ""
+
+    answers = _get_answers()
+    candidate_summary = (
+        f"Name: {answers.get('full_name', '')}, "
+        f"Email: {answers.get('email', '')}, "
+        f"Phone: {answers.get('phone', '')}, "
+        f"University: {answers.get('university', '')}, "
+        f"GPA: {answers.get('gpa', '')}, "
+        f"Degree: Bachelor of Science in Software Engineering, "
+        f"Year: {answers.get('current_year_of_study', '3')}, "
+        f"Skills: {answers.get('skills', '')}. "
+        f"{general_ctx}"
+    )
+
+    vision_prompt = f"""You are helping fill out a job application form.
+
+CANDIDATE PROFILE:
+{candidate_summary}
+
+PROJECTS:
+{projects_summary}
+
+SKILLS:
+{skills_summary}
+
+Look at this screenshot of the current form page.
+Identify ALL fields that are:
+  1. Visually empty or showing a placeholder / "Select One"
+  2. Required (marked with * or "required")
+
+For each such field, return the action needed to fill it.
+
+Respond with a JSON array ONLY — no markdown, no explanation:
+[
+  {{
+    "field_label": "<exact label text visible on the form>",
+    "action": "fill" | "select" | "click" | "check",
+    "value": "<the value to enter or option to select>",
+    "selector_hint": "<optional: CSS selector or aria-label hint if visible in DOM>"
+  }}
+]
+
+Rules:
+- "fill": for text inputs and textareas
+- "select": for dropdowns, comboboxes, radio buttons
+- "check": for checkboxes
+- "click": for buttons that need to be clicked (e.g. upload, add)
+- Use candidate data above to determine values
+- For "Degree": use "Bachelor of Science" or "Bachelor's"
+- For Yes/No questions about work authorization: answer "Yes"
+- For visa sponsorship: answer "No"
+- If the form looks complete and ready to submit, return []
+"""
+
+    for attempt in range(max_retries):
+        # Take screenshot
+        shot_path = _screenshot(page, job_id, f"vision_agent_{attempt:02d}")
+        if not shot_path.exists():
+            logger.warning(f"[{job_id}] Vision agent: screenshot failed, skipping")
+            break
+
+        # Ask Groq Vision
+        try:
+            b64 = _image_to_base64(shot_path)
+            response = client.chat.completions.create(
+                model="llama-3.2-90b-vision-preview",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": vision_prompt},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/png;base64,{b64}"
+                            }},
+                        ],
+                    }
+                ],
+                max_tokens=1024,
+                temperature=0.1,
+            )
+            raw = response.choices[0].message.content or ""
+            actions = _parse_json_response(raw)
+            if not isinstance(actions, list):
+                logger.warning(f"[{job_id}] Vision agent: unexpected response format")
+                break
+        except Exception as e:
+            logger.error(f"[{job_id}] Vision agent: Vision API call failed: {e}")
+            break
+
+        if not actions:
+            logger.info(f"[{job_id}] Vision agent: no unfilled fields detected")
+            break
+
+        logger.info(f"[{job_id}] Vision agent attempt {attempt + 1}: "
+                    f"{len(actions)} action(s) to execute")
+
+        # Execute each action
+        any_filled = False
+        for action_item in actions:
+            field_label = action_item.get("field_label", "")
+            action = action_item.get("action", "fill")
+            value = action_item.get("value", "")
+            selector_hint = action_item.get("selector_hint", "")
+
+            step += 1
+            _step(step, f"Vision agent: {action} \"{field_label}\" -> \"{value[:50]}\"")
+
+            try:
+                if action == "fill":
+                    # Try label → selector_hint → aria-label
+                    filled = False
+                    for loc_fn in [
+                        lambda: page.get_by_label(field_label, exact=False),
+                        lambda: page.locator(selector_hint) if selector_hint else None,
+                    ]:
+                        try:
+                            loc = loc_fn()
+                            if loc is None:
+                                continue
+                            if loc.count() > 0 and loc.first.is_visible():
+                                loc.first.fill(value)
+                                filled = True
+                                any_filled = True
+                                break
+                        except Exception:
+                            continue
+                    if not filled:
+                        _step(step, f"Vision agent: could not locate field \"{field_label}\"")
+
+                elif action == "select":
+                    # Try native select first, then combobox
+                    pseudo_field = {"label": field_label, "type": "select", "options": []}
+                    filled, step = _fill_dropdown(page, pseudo_field, value, step,
+                                                  content_generator=content_generator)
+                    if not filled:
+                        pseudo_field["type"] = "radio"
+                        filled, step = _fill_radio(page, pseudo_field, value, step,
+                                                   content_generator=content_generator)
+                    if filled:
+                        any_filled = True
+
+                elif action == "check":
+                    try:
+                        loc = page.get_by_label(field_label, exact=False)
+                        if loc.count() > 0 and loc.first.is_visible():
+                            if not loc.first.is_checked():
+                                loc.first.check()
+                            any_filled = True
+                    except Exception:
+                        pass
+
+                elif action == "click":
+                    try:
+                        page.get_by_text(value, exact=False).first.click()
+                        page.wait_for_timeout(500)
+                        any_filled = True
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                _step(step, f"Vision agent: action failed for \"{field_label}\": {e}")
+
+        if not any_filled:
+            logger.info(f"[{job_id}] Vision agent: no actions succeeded, stopping")
+            break
+
+        page.wait_for_timeout(800)
+
+    return step
+
 
 def _auto_verify_email(platform_key: str, page, client: OpenAI,
                        job_id: str, step: int, result: dict) -> tuple[bool, int]:
@@ -1882,6 +2428,12 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
         api_key=os.environ["GROQ_API_KEY"],
         base_url="https://api.groq.com/openai/v1",
     )
+    content_gen = ContentGenerator(
+        client=client,
+        job_title=job_title,
+        company=company,
+        job_description=job_description or "",
+    )
     ats_key = _extract_ats_key(apply_url)
     cv_path = _resolve_cv_path(cv_variant)
     result = {
@@ -2065,6 +2617,7 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                             success, step = _fill_linkedin_easy_apply_modal(
                                 page, client, job_id, cover_letter,
                                 answers_dict, result, step, auto_submit=auto_submit,
+                                content_generator=content_gen,
                             )
                             result["success"] = success
                             result["application_result"] = "easy_apply" if success else "failed"
@@ -2267,14 +2820,17 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                         value = str(CV_PATH)
                     else:
                         value = lookup_answer(field_label, candidate_field_key,
-                                              field.get("type", "text"))
+                                              field.get("type", "text"),
+                                              content_generator=content_gen,
+                                              options=field.get("options"))
 
                     # Cover letter override
                     if candidate_field_key == "cover_letter" or normalize_field_name(field_label) == "cover_letter":
                         value = cover_letter
 
                     _filled, step = _fill_field(page, field, value, step,
-                                                cover_letter=cover_letter)
+                                                cover_letter=cover_letter,
+                                                content_generator=content_gen)
 
                     # WhatsApp fallback: required textarea with no value found
                     if not _filled and field.get("required") and \
@@ -2340,7 +2896,16 @@ def apply_to_job(job_id: str, apply_url: str, job_title: str, company: str,
                     all_ok, step, empty = _verify_required_fields(page, fields, step)
 
                     if not all_ok:
-                        _step(step, f"Cannot submit: {len(empty)} required fields empty")
+                        _step(step, f"{len(empty)} required fields empty — running Vision agent pass")
+                        # Vision agent: last attempt to fix remaining empty fields
+                        step = _vision_agent_pass(
+                            page, client, content_gen, job_id, step, max_retries=2
+                        )
+                        # Re-validate after Vision agent
+                        all_ok, step, empty = _verify_required_fields(page, fields, step)
+
+                    if not all_ok:
+                        _step(step, f"Cannot submit: {len(empty)} required fields still empty after Vision agent")
                         result["error"] = f"Required fields empty: {', '.join(empty)}"
                         shot = _screenshot(page, job_id, "05_validation_failed")
                         result["screenshots"].append(str(shot))
@@ -2728,6 +3293,7 @@ def _fill_linkedin_easy_apply_modal(
     result: dict,
     step: int,
     auto_submit: bool = False,
+    content_generator: "ContentGenerator | None" = None,
 ) -> tuple[bool, int]:
     """Fill and submit a LinkedIn Easy Apply modal.
 
@@ -2786,7 +3352,8 @@ def _fill_linkedin_easy_apply_modal(
                     break
 
             value = answers.get(field.get("candidate_field", ""), "")
-            _, step = _fill_field(page, field, value, step, cover_letter=cover_letter)
+            _, step = _fill_field(page, field, value, step, cover_letter=cover_letter,
+                                  content_generator=content_generator)
 
         # ── 4. Consent / privacy checkboxes ──────────────────────────────
         step = _check_consent_checkboxes(page, step)

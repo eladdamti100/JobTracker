@@ -13,6 +13,7 @@ build/
 # Data & Personal info
 data/cv.pdf
 data/CV Resume.pdf
+data/Nimrod_Netzer_Resume.pdf
 data/*.db
 data/linkedin_session.json
 data/default_answers.yaml

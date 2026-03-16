@@ -1,0 +1,106 @@
+# ── Candidate Database for Dynamic Content Generation ────────────────────────
+# This file is read by core/content_generator.py to generate tailored answers
+# for open-ended form fields (e.g. "Describe a relevant project", "Why this role?").
+#
+# HOW TO USE:
+#   - Fill in your real projects below. The more specific the highlights, the better.
+#   - Keep descriptions factual and first-person. Avoid buzzwords.
+#   - Tags help the AI pick the most relevant project per job description.
+#   - skills_context gives depth beyond a flat list.
+#   - general_context is used as the fallback "about me" for any field.
+# ─────────────────────────────────────────────────────────────────────────────
+
+projects:
+  - name: "JobTracker"
+    tech: [Python, Playwright, Flask, React, "Next.js", SQLAlchemy, "Groq API", Twilio, SQLite]
+    description: >
+      Autonomous job-hunting agent for software engineering students in Israel.
+      Scans job boards (HireMeTech, LinkedIn, WhatsApp groups), scores listings
+      with an LLM, sends WhatsApp suggestions via Twilio, and auto-fills
+      application forms using Playwright and Groq Vision.
+    highlights:
+      - "Form-filling engine (~3000 lines) with 4-strategy cascade: label → placeholder → attribute → type fallback"
+      - "Groq Vision (llama-3.2-90b) identifies form fields from screenshots for unknown ATS platforms"
+      - "ATS adapter pattern supporting Workday, Greenhouse, Lever, LinkedIn Easy Apply, and generic sites"
+      - "WhatsApp bot via Twilio: user replies YES/NO/SKIP to approve or reject job suggestions"
+      - "Next.js dashboard for stats, suggested jobs, and application history"
+      - "APScheduler for automated scans every 12h and expiry checks every 1h"
+    tags: [automation, AI, full-stack, web-scraping, backend, LLM, playwright, flask, react]
+    scale: "~5000 lines Python + Next.js dashboard, solo project"
+
+  - name: "Netflix Clone"
+    tech: [React, "Node.js", MongoDB, JWT, "REST API"]
+    description: >
+      Full-stack streaming platform clone with user authentication, movie catalog,
+      and a personalized recommendation system based on watch history.
+    highlights:
+      - "JWT authentication with access and refresh tokens, secure session management"
+      - "Recommendation engine that suggests movies based on user watch history"
+      - "RESTful Node.js/Express backend with MongoDB for user and content data"
+      - "Responsive React frontend with dynamic routing and protected routes"
+    tags: [full-stack, web, frontend, backend, authentication, mongodb, react]
+    scale: "Academic project, team of 2"
+
+  - name: "Multi-threaded C++ Schedule Builder"
+    tech: ["C++", Qt, multithreading, "STL"]
+    description: >
+      Academic schedule optimization tool with a Qt5 GUI that generates conflict-free
+      course schedules. Parallelized the constraint-satisfaction algorithm using a
+      thread pool, cutting generation time from 15 seconds to under 3 seconds.
+    highlights:
+      - "Reduced schedule generation time from 15s to under 3s using a C++ thread pool"
+      - "Qt5 GUI with drag-and-drop schedule editing and real-time conflict detection"
+      - "Constraint-satisfaction solver handles overlapping time slots and prerequisites"
+      - "Mutex/condition variable synchronization for safe concurrent access to shared state"
+    tags: [systems, performance, algorithms, C++, multithreading, desktop, optimization]
+    scale: "Academic project, ~3000 lines, solo"
+
+
+# ── Work / Academic Experience ────────────────────────────────────────────────
+experiences:
+  - role: "B.Sc. Software Engineering Student"
+    company: "Bar Ilan University"
+    period: "2022 – present"
+    description: >
+      3rd year student, GPA 89+. Coursework includes algorithms, data structures,
+      operating systems, networking, OOP, computer architecture, and software design.
+    highlights:
+      - "Advanced OS lab: implemented mini-shell and memory allocator in C"
+      - "Worked on multi-threaded systems projects in C++"
+      - "Strong algorithmic background from competitive coursework"
+    tags: [academic, systems, backend, C, C++, algorithms]
+
+  # ── ADD WORK EXPERIENCE OR INTERNSHIPS BELOW ─────────────────────────────
+  # - role: "Backend Developer Intern"
+  #   company: "Some Company"
+  #   period: "Summer 2024"
+  #   description: ""
+  #   highlights:
+  #     - ""
+  #   tags: []
+
+
+# ── Skills with Context ───────────────────────────────────────────────────────
+# These explain HOW you use each skill, not just that you know it.
+skills_context:
+  python: "3 years — Flask REST APIs, SQLAlchemy ORM, Playwright automation, APScheduler, asyncio, scripting"
+  cpp: "2 years — systems programming, multithreading with mutexes/condition variables, STL, academic projects"
+  javascript: "2 years — React (hooks, context), Node.js, Express, REST API integration"
+  java: "2 years — OOP, data structures coursework, Android basics"
+  c: "2 years — OS-level programming, pointers, memory management, system calls"
+  docker: "Basic — containerization, docker-compose for local dev environments"
+  linux: "Daily driver — bash scripting, process management, file system, SSH"
+  git: "Daily — branching, rebasing, pull requests, GitHub workflows"
+  sql: "SQLite (production use in JobTracker), basic PostgreSQL"
+  react: "Next.js 15, hooks, Tailwind CSS, REST API consumption"
+  groq_api: "Prompt engineering for job scoring, Vision-based form analysis, structured JSON responses"
+
+
+# ── General Context ───────────────────────────────────────────────────────────
+# Used as fallback "about me" paragraph for any open-ended field.
+general_context: >
+  3rd-year Software Engineering student at Bar-Ilan University (GPA 89+),
+  seeking a student or junior position in backend, full-stack, or systems development.
+  I build production-like projects independently — my latest, JobTracker, is a
+  fully autonomous job-hunting agent using Playwright, Flask, Groq Vision, and Twilio.
+  I learn quickly, work well under ambiguity, and care about shipping working software.

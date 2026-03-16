@@ -1220,12 +1220,56 @@ class WorkdayAdapter(AdapterBase):
                 logger.debug(f"Rich text fill: {exc}")
 
         # CV/resume file upload
-        if _visible(page, WD["file_upload"]) and cv_path and cv_path.exists():
+        # Workday "My Experience" page has a drag-and-drop zone with a hidden
+        # input[type="file"] underneath. We detect the zone first to confirm we're
+        # on the right page, then upload via set_input_files (works on hidden inputs).
+        if cv_path and cv_path.exists():
             try:
-                fu = page.locator(WD["file_upload"]).first
-                fu.set_input_files(str(cv_path))
-                page.wait_for_timeout(2_000)
-                logger.info(f"[{self.job_hash[:8]}] CV uploaded to Workday")
+                # Confirm Resume/CV section is present on this page
+                resume_section_visible = any(
+                    page.locator(sel).count() > 0
+                    for sel in (
+                        '[data-automation-id*="resume" i]',
+                        '[data-automation-id*="cv" i]',
+                        'p:has-text("Upload a file")',
+                        'p:has-text("Resume")',
+                        'h3:has-text("Resume")',
+                    )
+                )
+                if resume_section_visible:
+                    # Scroll to the upload zone so Workday renders the input
+                    try:
+                        zone = page.locator(
+                            '[data-automation-id*="resume" i], '
+                            'p:has-text("Upload a file"), '
+                            'h3:has-text("Resume")'
+                        ).first
+                        if zone.count() > 0:
+                            zone.scroll_into_view_if_needed()
+                            page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+
+                    # Try Workday-specific input selectors first, then generic
+                    fu_loc = None
+                    for sel in (
+                        '[data-automation-id*="resume" i] input[type="file"]',
+                        '[data-automation-id*="cv" i] input[type="file"]',
+                        'input[type="file"]',
+                    ):
+                        loc = page.locator(sel)
+                        if loc.count() > 0:
+                            fu_loc = loc.first
+                            break
+
+                    if fu_loc is not None:
+                        fu_loc.set_input_files(str(cv_path))
+                        page.wait_for_timeout(2_500)
+                        logger.info(f"[{self.job_hash[:8]}] CV uploaded to Workday")
+                    else:
+                        logger.debug(f"[{self.job_hash[:8]}] CV upload: input[type=file] not found on resume page")
+                else:
+                    logger.debug(f"[{self.job_hash[:8]}] CV upload: not on resume page, skipping")
             except Exception as exc:
                 logger.debug(f"CV upload: {exc}")
 
@@ -1361,8 +1405,26 @@ class WorkdayAdapter(AdapterBase):
         """
         try:
             # Guard: if education fields already visible, just fill them (no Add needed)
-            school_inp = page.locator('input[data-automation-id*="school" i]').first
-            edu_already_open = school_inp.count() > 0 and school_inp.is_visible()
+            # Try multiple selectors — different Workday tenants use different automation-IDs
+            _edu_open_selectors = [
+                'input[data-automation-id*="school" i]',
+                'input[data-automation-id*="institution" i]',
+                'input[data-automation-id*="educationInstitution" i]',
+            ]
+            edu_already_open = any(
+                page.locator(s).count() > 0 and page.locator(s).first.is_visible()
+                for s in _edu_open_selectors
+            )
+            # Fallback: if a "School" label is visible, the form is open
+            if not edu_already_open:
+                for lbl in ("School or University", "School", "University", "Institution"):
+                    try:
+                        loc = page.get_by_label(lbl, exact=False)
+                        if loc.count() > 0 and loc.first.is_visible():
+                            edu_already_open = True
+                            break
+                    except Exception:
+                        pass
 
             if not edu_already_open:
                 # Find Add button that comes AFTER "Education" heading AND BEFORE "Resume/CV"
